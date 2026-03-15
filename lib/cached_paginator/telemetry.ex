@@ -29,14 +29,7 @@ defmodule CachedPaginator.Telemetry do
 
   Emitted during periodic cleanup sweep.
 
-  Measurements: `%{table_count: integer(), pool_size: integer(), memory_bytes: integer(), expired_count: integer()}`
-  Metadata: `%{cache: atom()}`
-
-  ### `[:cached_paginator, :wait]`
-
-  Emitted when max tables reached and waiting for available table.
-
-  Measurements: `%{}`
+  Measurements: `%{pool_size: integer(), memory_bytes: integer(), expired_count: integer()}`
   Metadata: `%{cache: atom()}`
 
   ## Example Usage
@@ -87,16 +80,6 @@ defmodule CachedPaginator.Telemetry do
     :telemetry.execute(
       [:cached_paginator, :sweep],
       measurements,
-      %{cache: cache}
-    )
-  end
-
-  @doc false
-  @spec emit_wait(atom()) :: :ok
-  def emit_wait(cache) do
-    :telemetry.execute(
-      [:cached_paginator, :wait],
-      %{},
       %{cache: cache}
     )
   end

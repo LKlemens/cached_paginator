@@ -17,12 +17,14 @@ defmodule CachedPaginatorTest do
       filters = [status: :active]
       ids = ["id1", "id2", "id3"]
 
-      {{table, size}, {filter_hash, created_at}} = CachedPaginator.store(cache, filters, ids)
+      {{table, cache_key, size}, {filter_hash, created_at}} =
+        CachedPaginator.store(cache, filters, ids)
 
       assert is_reference(table)
       assert size == 3
       assert is_integer(filter_hash)
       assert is_integer(created_at)
+      assert cache_key == {filter_hash, created_at}
     end
   end
 
@@ -37,7 +39,7 @@ defmodule CachedPaginatorTest do
 
       CachedPaginator.store(cache, filters, ids)
 
-      assert {:ok, {_table, 2}, _key} = CachedPaginator.get(cache, filters)
+      assert {:ok, {_table, _cache_key, 2}, _key} = CachedPaginator.get(cache, filters)
     end
 
     test "returns :miss when cache expired", %{cache: cache} do
@@ -59,7 +61,8 @@ defmodule CachedPaginatorTest do
       # wait past fresh_ttl but within max_ttl
       Process.sleep(150)
 
-      assert {:ok, {_table, 2}, ^cache_key} = CachedPaginator.get_by_cursor(cache, cache_key)
+      assert {:ok, {_table, ^cache_key, 2}, ^cache_key} =
+               CachedPaginator.get_by_cursor(cache, cache_key)
     end
 
     test "returns :miss when cache exceeded max_ttl", %{cache: cache} do
@@ -78,7 +81,8 @@ defmodule CachedPaginatorTest do
       filters = [status: :active]
       fetch_fn = fn -> ["id1", "id2", "id3"] end
 
-      {{table, size}, cursor} = CachedPaginator.get_or_create(cache, filters, fetch_fn)
+      {{table, _cache_key, size}, cursor} =
+        CachedPaginator.get_or_create(cache, filters, fetch_fn)
 
       assert is_reference(table)
       assert size == 3
@@ -114,7 +118,7 @@ defmodule CachedPaginatorTest do
 
       # without cursor - should miss (fresh_ttl expired)
       # with cursor - should hit (within max_ttl)
-      {{_table, size}, _cursor} =
+      {{_table, _cache_key, size}, _cursor} =
         CachedPaginator.get_or_create(cache, filters, fn -> ["new"] end, cursor)
 
       # should still get original data
@@ -129,7 +133,7 @@ defmodule CachedPaginatorTest do
       Process.sleep(150)
 
       # with first_page: true, should fetch new data
-      {{_table, size}, _cursor} =
+      {{_table, _cache_key, size}, _cursor} =
         CachedPaginator.get_or_create(cache, filters, fn -> ["new1", "new2"] end, cursor,
           first_page: true
         )
@@ -170,23 +174,31 @@ defmodule CachedPaginatorTest do
     end
   end
 
-  describe "fetch_range/3" do
+  describe "fetch_range/4" do
     test "fetches range of ids from cache table", %{cache: cache} do
       filters = [status: :active]
       ids = ["a", "b", "c", "d", "e"]
-      {{table, _size}, _key} = CachedPaginator.store(cache, filters, ids)
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, filters, ids)
 
-      assert ["b", "c", "d"] == CachedPaginator.fetch_range(table, 1, 3)
-      assert ["a", "b"] == CachedPaginator.fetch_range(table, 0, 1)
-      assert ["e"] == CachedPaginator.fetch_range(table, 4, 4)
+      assert ["b", "c", "d"] == CachedPaginator.fetch_range(table, cache_key, 1, 3)
+      assert ["a", "b"] == CachedPaginator.fetch_range(table, cache_key, 0, 1)
+      assert ["e"] == CachedPaginator.fetch_range(table, cache_key, 4, 4)
     end
 
     test "handles out of bounds gracefully", %{cache: cache} do
       filters = [status: :active]
-      {{table, _size}, _key} = CachedPaginator.store(cache, filters, ["a", "b"])
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, filters, ["a", "b"])
 
-      assert ["b"] == CachedPaginator.fetch_range(table, 1, 5)
-      assert [] == CachedPaginator.fetch_range(table, 10, 15)
+      assert ["b"] == CachedPaginator.fetch_range(table, cache_key, 1, 5)
+      assert [] == CachedPaginator.fetch_range(table, cache_key, 10, 15)
+    end
+
+    test "multiple queries coexist in shared tables", %{cache: cache} do
+      {{table1, key1, _}, _} = CachedPaginator.store(cache, [a: 1], ["x", "y"])
+      {{table2, key2, _}, _} = CachedPaginator.store(cache, [b: 2], ["p", "q", "r"])
+
+      assert ["x", "y"] == CachedPaginator.fetch_range(table1, key1, 0, 1)
+      assert ["p", "q", "r"] == CachedPaginator.fetch_range(table2, key2, 0, 2)
     end
   end
 
@@ -230,43 +242,9 @@ defmodule CachedPaginatorTest do
 
       stats = CachedPaginator.stats(cache)
 
-      assert stats.table_count == 2
-      assert stats.pool_size == 0
+      assert stats.pool_size == 10
       assert is_integer(stats.memory_bytes)
       assert stats.memory_bytes > 0
-    end
-  end
-
-  describe "max_tables backpressure" do
-    test "waits when max_tables reached" do
-      name = :"backpressure_test_#{:erlang.unique_integer([:positive])}"
-
-      {:ok, pid} =
-        CachedPaginator.start_link(
-          name: name,
-          max_tables: 2,
-          max_ttl: 200,
-          sweep_interval: 100
-        )
-
-      # fill up tables
-      CachedPaginator.store(name, [a: 1], ["id1"])
-      CachedPaginator.store(name, [b: 2], ["id2"])
-
-      stats = CachedPaginator.stats(name)
-      assert stats.table_count == 2
-
-      # this should wait until sweep frees a table
-      task =
-        Task.async(fn ->
-          CachedPaginator.store(name, [c: 3], ["id3"])
-        end)
-
-      # give time for sweep to run
-      result = Task.await(task, 1000)
-      assert {{_table, 1}, _key} = result
-
-      GenServer.stop(pid)
     end
   end
 

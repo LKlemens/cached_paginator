@@ -6,13 +6,16 @@ defmodule CachedPaginator do
   Multiple users requesting the same data share the cached result, avoiding
   repeated expensive queries.
 
+  Uses a pre-initialized pool of shared ETS tables. Multiple query results
+  coexist in each table using composite keys `{cache_key, index}`.
+
   ## Features
 
   - **Query caching**: Run expensive query once, serve all page requests from cache
   - **Locking**: Concurrent requests for same data wait for ongoing query
   - **Cursor stability**: Same result set across all pages during session
   - **Two-tier TTL**: Fresh data for new sessions, extended TTL for ongoing pagination
-  - **Backpressure**: Max tables limit prevents unbounded growth
+  - **Pre-initialized pool**: Fixed number of ETS tables created at startup, zero runtime allocation
   - **Telemetry**: Full observability (hits, misses, table count, memory usage)
 
   ## Usage
@@ -27,7 +30,8 @@ defmodule CachedPaginator do
       end)
 
       # Fetch a page range
-      ids = CachedPaginator.fetch_range(table, 0, 19)
+      {table, cache_key, size} = data
+      ids = CachedPaginator.fetch_range(table, cache_key, 0, 19)
 
   ## TTL Rules
 
@@ -43,7 +47,7 @@ defmodule CachedPaginator do
         fresh_ttl: 300,            # ms, default: 300
         max_ttl: 10_000,           # ms, default: 10_000
         sweep_interval: 5_000,     # ms, default: 5_000
-        max_tables: 100            # default: 100
+        pool_size: 100             # default: 100
       )
   """
 
@@ -54,14 +58,14 @@ defmodule CachedPaginator do
   @default_fresh_ttl 300
   @default_max_ttl 10_000
   @default_sweep_interval 5_000
-  @default_max_tables 100
+  @default_pool_size 100
   @wait_poll_interval 50
 
   @type filters :: term()
   @type cache_key :: {filter_hash :: non_neg_integer(), created_at :: integer()}
   @type cursor :: binary()
   @type table_ref :: :ets.tid()
-  @type cache_data :: {table_ref(), non_neg_integer()}
+  @type cache_data :: {table_ref(), cache_key(), non_neg_integer()}
   @type name :: GenServer.name()
 
   # API
@@ -75,7 +79,7 @@ defmodule CachedPaginator do
   - `:fresh_ttl` - TTL in ms for fresh cache entries (default: 300)
   - `:max_ttl` - TTL in ms for cursor-based access (default: 10_000)
   - `:sweep_interval` - Interval in ms for cleanup sweep (default: 5_000)
-  - `:max_tables` - Maximum number of ETS tables (default: 100)
+  - `:pool_size` - Number of pre-initialized ETS tables (default: 100)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -154,7 +158,7 @@ defmodule CachedPaginator do
 
     case :ets.lookup(config.registry, key) do
       [{^key, table, size}] when now - created_at <= config.max_ttl ->
-        {:ok, {table, size}, key}
+        {:ok, {table, key, size}, key}
 
       _ ->
         :miss
@@ -175,7 +179,7 @@ defmodule CachedPaginator do
 
     case :ets.lookup(config.latest_index, filter_hash) do
       [{^filter_hash, created_at, table, size}] when now - created_at <= config.fresh_ttl ->
-        {:ok, {table, size}, {filter_hash, created_at}}
+        {:ok, {table, {filter_hash, created_at}, size}, {filter_hash, created_at}}
 
       _ ->
         :miss
@@ -193,12 +197,14 @@ defmodule CachedPaginator do
   @doc """
   Fetch a range of IDs from the cache table using direct key lookup.
   This is O(page_size) regardless of table size or position.
+
+  Requires the `cache_key` to identify which query's data to read from the shared table.
   """
-  @spec fetch_range(table_ref(), non_neg_integer(), non_neg_integer()) :: [term()]
-  def fetch_range(table, start_idx, end_idx) do
+  @spec fetch_range(table_ref(), cache_key(), non_neg_integer(), non_neg_integer()) :: [term()]
+  def fetch_range(table, cache_key, start_idx, end_idx) do
     Enum.reduce(end_idx..start_idx//-1, [], fn idx, acc ->
-      case :ets.lookup(table, idx) do
-        [{^idx, id}] -> [id | acc]
+      case :ets.lookup(table, {cache_key, idx}) do
+        [{_, id}] -> [id | acc]
         [] -> acc
       end
     end)
@@ -282,7 +288,7 @@ defmodule CachedPaginator do
     fresh_ttl = Keyword.get(opts, :fresh_ttl, @default_fresh_ttl)
     max_ttl = Keyword.get(opts, :max_ttl, @default_max_ttl)
     sweep_interval = Keyword.get(opts, :sweep_interval, @default_sweep_interval)
-    max_tables = Keyword.get(opts, :max_tables, @default_max_tables)
+    pool_size = Keyword.get(opts, :pool_size, @default_pool_size)
 
     # create unique ETS table names for this instance
     registry = :"#{name}_registry"
@@ -293,6 +299,12 @@ defmodule CachedPaginator do
     :ets.new(latest_index, [:set, :public, :named_table, read_concurrency: true])
     :ets.new(locks, [:set, :public, :named_table])
 
+    # pre-initialize pool of shared ETS tables
+    pool =
+      for i <- 1..pool_size do
+        :ets.new(:"#{name}_data_#{i}", [:set, :public, read_concurrency: true])
+      end
+
     config = %{
       name: name,
       registry: registry,
@@ -300,7 +312,7 @@ defmodule CachedPaginator do
       locks: locks,
       fresh_ttl: fresh_ttl,
       max_ttl: max_ttl,
-      max_tables: max_tables
+      pool_size: pool_size
     }
 
     :persistent_term.put({__MODULE__, name, :config}, config)
@@ -310,86 +322,56 @@ defmodule CachedPaginator do
     state = %{
       config: config,
       sweep_interval: sweep_interval,
-      pool: [],
-      table_count: 0
+      pool: pool,
+      next_table: 0
     }
 
     {:ok, state}
   end
 
   @impl true
-  def handle_call({:store, filters, ids}, from, state) do
-    %{config: config, pool: pool, table_count: table_count} = state
-
-    if table_count >= config.max_tables and pool == [] do
-      Logger.error(
-        "[CachedPaginator] max tables (#{config.max_tables}) reached, waiting for available table"
-      )
-
-      CachedPaginator.Telemetry.emit_wait(config.name)
-      send(self(), {:retry_store, filters, ids, from})
-      {:noreply, state}
-    else
-      {result, new_state} = do_store(filters, ids, state)
-      {:reply, result, new_state}
-    end
+  def handle_call({:store, filters, ids}, _from, state) do
+    {result, new_state} = do_store(filters, ids, state)
+    {:reply, result, new_state}
   end
 
   @impl true
   def handle_call(:clear, _from, state) do
     %{config: config, pool: pool} = state
 
-    tables =
-      :ets.tab2list(config.registry)
-      |> Enum.map(fn {_key, table, _size} -> table end)
-
     :ets.delete_all_objects(config.registry)
     :ets.delete_all_objects(config.latest_index)
     :ets.delete_all_objects(config.locks)
 
-    {:reply, :ok, %{state | pool: tables ++ pool}}
+    Enum.each(pool, &:ets.delete_all_objects/1)
+
+    {:reply, :ok, %{state | next_table: 0}}
   end
 
   @impl true
   def handle_call(:stats, _from, state) do
-    %{config: config, pool: pool, table_count: table_count} = state
+    %{config: config, pool: pool} = state
 
-    memory_bytes = calculate_memory(config.registry, pool)
+    memory_bytes = calculate_memory(pool)
 
     stats = %{
-      table_count: table_count,
-      pool_size: length(pool),
-      memory_bytes: memory_bytes,
-      max_tables: config.max_tables
+      pool_size: config.pool_size,
+      memory_bytes: memory_bytes
     }
 
     {:reply, stats, state}
   end
 
   @impl true
-  def handle_info({:retry_store, filters, ids, from}, state) do
-    %{config: config, pool: pool, table_count: table_count} = state
-
-    if table_count >= config.max_tables and pool == [] do
-      Process.send_after(self(), {:retry_store, filters, ids, from}, @wait_poll_interval)
-      {:noreply, state}
-    else
-      {result, new_state} = do_store(filters, ids, state)
-      GenServer.reply(from, result)
-      {:noreply, new_state}
-    end
-  end
-
-  @impl true
   def handle_info(:sweep_expired, state) do
-    %{config: config, pool: pool, table_count: table_count, sweep_interval: sweep_interval} =
-      state
+    %{config: config, pool: pool, sweep_interval: sweep_interval} = state
 
     now = System.monotonic_time(:millisecond)
-    expired_tables = collect_expired(config.registry, config.max_ttl, now)
+    expired = collect_expired(config.registry, config.max_ttl, now)
 
-    Enum.each(expired_tables, fn {{filter_hash, created_at} = key, _table} ->
+    Enum.each(expired, fn {{filter_hash, created_at} = key, table} ->
       :ets.delete(config.registry, key)
+      :ets.match_delete(table, {{key, :_}, :_})
 
       case :ets.lookup(config.latest_index, filter_hash) do
         [{^filter_hash, ^created_at, _, _}] ->
@@ -400,50 +382,37 @@ defmodule CachedPaginator do
       end
     end)
 
-    expired_table_refs = Enum.map(expired_tables, fn {_key, table} -> table end)
-    new_pool = expired_table_refs ++ pool
-
-    # emit telemetry with current stats
-    active_tables = table_count - length(expired_table_refs)
-    memory_bytes = calculate_memory(config.registry, new_pool)
+    memory_bytes = calculate_memory(pool)
 
     CachedPaginator.Telemetry.emit_sweep(config.name, %{
-      table_count: active_tables,
-      pool_size: length(new_pool),
+      pool_size: config.pool_size,
       memory_bytes: memory_bytes,
-      expired_count: length(expired_tables)
+      expired_count: length(expired)
     })
 
     schedule_sweep(sweep_interval)
 
-    {:noreply, %{state | pool: new_pool, table_count: active_tables}}
+    {:noreply, state}
   end
 
   defp do_store(filters, ids, state) do
-    %{config: config, pool: pool, table_count: table_count} = state
+    %{config: config, pool: pool, next_table: next_table} = state
 
     filter_hash = :erlang.phash2(filters)
     now = System.monotonic_time(:millisecond)
     cache_key = {filter_hash, now}
 
-    {table, new_pool, new_table_count} =
-      case pool do
-        [t | rest] ->
-          :ets.delete_all_objects(t)
-          {t, rest, table_count}
+    # round-robin table assignment
+    table = Enum.at(pool, next_table)
+    new_next = rem(next_table + 1, config.pool_size)
 
-        [] ->
-          t = :ets.new(:cached_paginator_data, [:ordered_set, :public, read_concurrency: true])
-          {t, [], table_count + 1}
-      end
-
-    {table, size} = populate_table(table, ids)
+    size = populate_table(table, cache_key, ids)
 
     :ets.insert(config.registry, {cache_key, table, size})
     :ets.insert(config.latest_index, {filter_hash, now, table, size})
 
-    result = {{table, size}, cache_key}
-    new_state = %{state | pool: new_pool, table_count: new_table_count}
+    result = {{table, cache_key, size}, cache_key}
+    new_state = %{state | next_table: new_next}
 
     {result, new_state}
   end
@@ -466,24 +435,14 @@ defmodule CachedPaginator do
     )
   end
 
-  defp populate_table(table, ids) do
-    entries = Enum.with_index(ids, fn id, idx -> {idx, id} end)
+  defp populate_table(table, cache_key, ids) do
+    entries = Enum.with_index(ids, fn id, idx -> {{cache_key, idx}, id} end)
     :ets.insert(table, entries)
-    {table, length(ids)}
+    length(ids)
   end
 
-  defp calculate_memory(registry, pool) do
-    # memory for registry tables
-    registry_tables =
-      :ets.foldl(
-        fn {_key, table, _size}, acc -> [table | acc] end,
-        [],
-        registry
-      )
-
-    all_tables = registry_tables ++ pool
-
-    Enum.reduce(all_tables, 0, fn table, acc ->
+  defp calculate_memory(pool) do
+    Enum.reduce(pool, 0, fn table, acc ->
       case :ets.info(table, :memory) do
         :undefined -> acc
         # :ets.info returns memory in words, convert to bytes
