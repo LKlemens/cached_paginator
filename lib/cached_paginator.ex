@@ -63,6 +63,7 @@ defmodule CachedPaginator do
 
   @type filters :: term()
   @type cache_key :: {filter_hash :: non_neg_integer(), created_at :: integer()}
+  @type result_hash :: non_neg_integer()
   @type cursor :: binary()
   @type table_ref :: :ets.tid()
   @type cache_data :: {table_ref(), cache_key(), non_neg_integer()}
@@ -89,9 +90,9 @@ defmodule CachedPaginator do
 
   @doc """
   Store indexed data. Always creates a new cache entry with current timestamp.
-  Returns both cache_data and the cache_key (composite key).
+  Returns cache_data, cache_key, and result_hash.
   """
-  @spec store(name(), filters(), [term()]) :: {cache_data(), cache_key()}
+  @spec store(name(), filters(), [term()]) :: {cache_data(), cache_key(), result_hash()}
   def store(name, filters, ids) do
     GenServer.call(name, {:store, filters, ids})
   end
@@ -110,22 +111,31 @@ defmodule CachedPaginator do
   - cursor matches filters, not first page → uses max TTL
   - no cursor or mismatch → uses fresh TTL
 
-  Returns `{cache_data, cursor}` where cursor can be passed to subsequent requests.
+  ## Return Value
+
+  - `{cache_data, cursor}` — cache hit or fresh miss (no prior data to compare)
+  - `{cache_data, cursor, :data_changed}` — cursor expired and fresh data differs from cached
+
+  The `:data_changed` signal tells clients the underlying data changed since their
+  cursor was issued. Clients should prompt the user to restart from page 1.
   """
   @spec get_or_create(name(), filters(), (-> [term()]), cursor() | nil, keyword()) ::
-          {cache_data(), cursor()}
+          {cache_data(), cursor()} | {cache_data(), cursor(), :data_changed}
   def get_or_create(name, filters, fetch_fn, cursor \\ nil, opts \\ []) do
     config = get_config(name)
     filter_hash = :erlang.phash2(filters)
     first_page = Keyword.get(opts, :first_page, false)
 
+    decoded_cursor = decode_cursor(cursor)
+
     result =
-      case {decode_cursor(cursor), first_page} do
+      case {decoded_cursor, first_page} do
         {_, true} ->
           get(name, filters, config)
 
-        {{:ok, {cursor_filter_hash, _} = cursor_key}, false}
-        when cursor_filter_hash == filter_hash ->
+        {{:ok, cursor_tuple}, false}
+        when elem(cursor_tuple, 0) == filter_hash ->
+          cursor_key = extract_cache_key(decoded_cursor)
           get_by_cursor(name, cursor_key, config)
 
         _ ->
@@ -133,14 +143,25 @@ defmodule CachedPaginator do
       end
 
     case result do
-      {:ok, data, cache_key} ->
+      {:ok, data, cache_key, result_hash} ->
         CachedPaginator.Telemetry.emit_hit(name, filter_hash)
-        {data, encode_cursor(cache_key)}
+        {data, encode_cursor(cache_key, result_hash)}
 
       :miss ->
         CachedPaginator.Telemetry.emit_miss(name, filter_hash)
-        {data, cache_key} = locked_fetch_and_store(name, filters, fetch_fn, config)
-        {data, encode_cursor(cache_key)}
+        old_result_hash = if first_page, do: nil, else: extract_result_hash(decoded_cursor)
+
+        {data, cache_key, new_result_hash} =
+          locked_fetch_and_store(name, filters, fetch_fn, config)
+
+        new_cursor = encode_cursor(cache_key, new_result_hash)
+
+        if old_result_hash != nil and old_result_hash != new_result_hash do
+          CachedPaginator.Telemetry.emit_data_changed(name, filter_hash)
+          {data, new_cursor, :data_changed}
+        else
+          {data, new_cursor}
+        end
     end
   end
 
@@ -150,15 +171,16 @@ defmodule CachedPaginator do
   Direct ETS read using composite key - no GenServer call.
   Returns :miss if cache is older than max TTL.
   """
-  @spec get_by_cursor(name(), cache_key(), map()) :: {:ok, cache_data(), cache_key()} | :miss
+  @spec get_by_cursor(name(), cache_key(), map()) ::
+          {:ok, cache_data(), cache_key(), result_hash()} | :miss
   def get_by_cursor(name, {filter_hash, created_at} = key, config \\ nil)
       when is_integer(filter_hash) and is_integer(created_at) do
     config = config || get_config(name)
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(config.registry, key) do
-      [{^key, table, size}] when now - created_at <= config.max_ttl ->
-        {:ok, {table, key, size}, key}
+      [{^key, table, size, result_hash}] when now - created_at <= config.max_ttl ->
+        {:ok, {table, key, size}, key, result_hash}
 
       _ ->
         :miss
@@ -171,15 +193,17 @@ defmodule CachedPaginator do
   Uses latest_index for O(1) lookup. Returns fresh cache (< fresh_ttl old).
   Use for first page / new session requests.
   """
-  @spec get(name(), filters(), map()) :: {:ok, cache_data(), cache_key()} | :miss
+  @spec get(name(), filters(), map()) ::
+          {:ok, cache_data(), cache_key(), result_hash()} | :miss
   def get(name, filters, config \\ nil) do
     config = config || get_config(name)
     filter_hash = :erlang.phash2(filters)
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(config.latest_index, filter_hash) do
-      [{^filter_hash, created_at, table, size}] when now - created_at <= config.fresh_ttl ->
-        {:ok, {table, {filter_hash, created_at}, size}, {filter_hash, created_at}}
+      [{^filter_hash, created_at, table, size, result_hash}]
+      when now - created_at <= config.fresh_ttl ->
+        {:ok, {table, {filter_hash, created_at}, size}, {filter_hash, created_at}, result_hash}
 
       _ ->
         :miss
@@ -211,26 +235,36 @@ defmodule CachedPaginator do
   end
 
   @doc """
-  Encodes a cache key into a cursor string.
+  Encodes a cache key and result hash into a cursor string.
   """
-  @spec encode_cursor(cache_key()) :: cursor()
-  def encode_cursor({_filter_hash, _created_at} = cache_key) do
-    cache_key
+  @spec encode_cursor(cache_key(), result_hash()) :: cursor()
+  def encode_cursor({filter_hash, created_at}, result_hash) do
+    {filter_hash, created_at, result_hash}
     |> :erlang.term_to_binary()
     |> Base.url_encode64(padding: false)
   end
 
   @doc """
-  Decodes a cursor string into a cache key.
+  Decodes a cursor string into a cache key tuple.
+
+  Returns `{:ok, {filter_hash, created_at, result_hash}}` or `:error`.
   """
-  @spec decode_cursor(cursor() | nil) :: {:ok, cache_key()} | :error
+  @spec decode_cursor(cursor() | nil) ::
+          {:ok, {non_neg_integer(), integer(), non_neg_integer()}}
+          | :error
   def decode_cursor(nil), do: :error
 
   def decode_cursor(cursor) when is_binary(cursor) do
     with {:ok, binary} <- Base.url_decode64(cursor, padding: false),
-         {:ok, {filter_hash, created_at} = key}
-         when is_integer(filter_hash) and is_integer(created_at) <- safe_binary_to_term(binary) do
-      {:ok, key}
+         {:ok, term} <- safe_binary_to_term(binary) do
+      case term do
+        {filter_hash, created_at, result_hash}
+        when is_integer(filter_hash) and is_integer(created_at) and is_integer(result_hash) ->
+          {:ok, {filter_hash, created_at, result_hash}}
+
+        _ ->
+          :error
+      end
     else
       _ -> :error
     end
@@ -250,6 +284,12 @@ defmodule CachedPaginator do
     :persistent_term.get({__MODULE__, name, :config})
   end
 
+  defp extract_cache_key({:ok, {filter_hash, created_at, _result_hash}}),
+    do: {filter_hash, created_at}
+
+  defp extract_result_hash({:ok, {_, _, result_hash}}), do: result_hash
+  defp extract_result_hash(_), do: nil
+
   defp locked_fetch_and_store(name, filters, fetch_fn, config) do
     filter_hash = :erlang.phash2(filters)
 
@@ -268,7 +308,7 @@ defmodule CachedPaginator do
       Process.sleep(@wait_poll_interval)
 
       case get(name, filters, config) do
-        {:ok, data, cache_key} -> {data, cache_key}
+        {:ok, data, cache_key, result_hash} -> {data, cache_key, result_hash}
         :miss -> locked_fetch_and_store(name, filters, fetch_fn, config)
       end
     end
@@ -374,7 +414,7 @@ defmodule CachedPaginator do
       :ets.match_delete(table, {{key, :_}, :_})
 
       case :ets.lookup(config.latest_index, filter_hash) do
-        [{^filter_hash, ^created_at, _, _}] ->
+        [{^filter_hash, ^created_at, _, _, _}] ->
           :ets.delete(config.latest_index, filter_hash)
 
         _ ->
@@ -399,6 +439,7 @@ defmodule CachedPaginator do
     %{config: config, pool: pool, next_table: next_table} = state
 
     filter_hash = :erlang.phash2(filters)
+    result_hash = :erlang.phash2(ids)
     now = System.monotonic_time(:millisecond)
     cache_key = {filter_hash, now}
 
@@ -408,10 +449,10 @@ defmodule CachedPaginator do
 
     size = populate_table(table, cache_key, ids)
 
-    :ets.insert(config.registry, {cache_key, table, size})
-    :ets.insert(config.latest_index, {filter_hash, now, table, size})
+    :ets.insert(config.registry, {cache_key, table, size, result_hash})
+    :ets.insert(config.latest_index, {filter_hash, now, table, size, result_hash})
 
-    result = {{table, cache_key, size}, cache_key}
+    result = {{table, cache_key, size}, cache_key, result_hash}
     new_state = %{state | next_table: new_next}
 
     {result, new_state}
@@ -423,7 +464,7 @@ defmodule CachedPaginator do
 
   defp collect_expired(registry, max_ttl, now) do
     :ets.foldl(
-      fn {{_filter_hash, created_at} = key, table, _size}, acc ->
+      fn {{_filter_hash, created_at} = key, table, _size, _result_hash}, acc ->
         if now - created_at > max_ttl do
           [{key, table} | acc]
         else

@@ -25,6 +25,13 @@ defmodule CachedPaginator.Telemetry do
   Measurements: `%{duration: integer(), count: integer()}`
   Metadata: `%{cache: atom(), filter_hash: integer()}`
 
+  ### `[:cached_paginator, :data_changed]`
+
+  Emitted when an expired cursor is refreshed and the underlying data has changed.
+
+  Measurements: `%{}`
+  Metadata: `%{cache: atom(), filter_hash: integer()}`
+
   ### `[:cached_paginator, :sweep]`
 
   Emitted during periodic cleanup sweep.
@@ -70,6 +77,16 @@ defmodule CachedPaginator.Telemetry do
     :telemetry.execute(
       [:cached_paginator, :store],
       %{duration: duration, count: count},
+      %{cache: cache, filter_hash: filter_hash}
+    )
+  end
+
+  @doc false
+  @spec emit_data_changed(atom(), integer()) :: :ok
+  def emit_data_changed(cache, filter_hash) do
+    :telemetry.execute(
+      [:cached_paginator, :data_changed],
+      %{},
       %{cache: cache, filter_hash: filter_hash}
     )
   end

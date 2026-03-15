@@ -13,11 +13,11 @@ defmodule CachedPaginatorTest do
   end
 
   describe "store/3" do
-    test "stores data and returns cache_data and cache_key", %{cache: cache} do
+    test "stores data and returns cache_data, cache_key, and result_hash", %{cache: cache} do
       filters = [status: :active]
       ids = ["id1", "id2", "id3"]
 
-      {{table, cache_key, size}, {filter_hash, created_at}} =
+      {{table, cache_key, size}, {filter_hash, created_at}, result_hash} =
         CachedPaginator.store(cache, filters, ids)
 
       assert is_reference(table)
@@ -25,6 +25,7 @@ defmodule CachedPaginatorTest do
       assert is_integer(filter_hash)
       assert is_integer(created_at)
       assert cache_key == {filter_hash, created_at}
+      assert result_hash == :erlang.phash2(ids)
     end
   end
 
@@ -39,7 +40,8 @@ defmodule CachedPaginatorTest do
 
       CachedPaginator.store(cache, filters, ids)
 
-      assert {:ok, {_table, _cache_key, 2}, _key} = CachedPaginator.get(cache, filters)
+      assert {:ok, {_table, _cache_key, 2}, _key, _result_hash} =
+               CachedPaginator.get(cache, filters)
     end
 
     test "returns :miss when cache expired", %{cache: cache} do
@@ -56,18 +58,18 @@ defmodule CachedPaginatorTest do
   describe "get_by_cursor/3" do
     test "returns cached data within max_ttl", %{cache: cache} do
       filters = [status: :active]
-      {_data, cache_key} = CachedPaginator.store(cache, filters, ["id1", "id2"])
+      {_data, cache_key, _result_hash} = CachedPaginator.store(cache, filters, ["id1", "id2"])
 
       # wait past fresh_ttl but within max_ttl
       Process.sleep(150)
 
-      assert {:ok, {_table, ^cache_key, 2}, ^cache_key} =
+      assert {:ok, {_table, ^cache_key, 2}, ^cache_key, _result_hash} =
                CachedPaginator.get_by_cursor(cache, cache_key)
     end
 
     test "returns :miss when cache exceeded max_ttl", %{cache: cache} do
       filters = [status: :active]
-      {_data, cache_key} = CachedPaginator.store(cache, filters, ["id1"])
+      {_data, cache_key, _result_hash} = CachedPaginator.store(cache, filters, ["id1"])
 
       # wait for max_ttl (500ms) to expire
       Process.sleep(550)
@@ -89,7 +91,7 @@ defmodule CachedPaginatorTest do
       assert is_binary(cursor)
     end
 
-    test "returns cached data on hit", %{cache: cache} do
+    test "returns cached data on hit without data_changed", %{cache: cache} do
       filters = [status: :active]
       ids = ["id1", "id2"]
       fetch_count = :counters.new(1, [:atomics])
@@ -141,6 +143,50 @@ defmodule CachedPaginatorTest do
       assert size == 2
     end
 
+    test "expired cursor with same data does not return :data_changed", %{cache: cache} do
+      filters = [status: :active]
+      ids = ["id1", "id2", "id3"]
+
+      {_data, cursor} = CachedPaginator.get_or_create(cache, filters, fn -> ids end)
+
+      # wait for both fresh_ttl AND max_ttl to expire
+      Process.sleep(550)
+
+      # same data → no :data_changed signal
+      result = CachedPaginator.get_or_create(cache, filters, fn -> ids end, cursor)
+      assert {_data, _cursor} = result
+      assert tuple_size(result) == 2
+    end
+
+    test "expired cursor with different data returns :data_changed", %{cache: cache} do
+      filters = [status: :active]
+
+      {_data, cursor} = CachedPaginator.get_or_create(cache, filters, fn -> ["id1", "id2"] end)
+
+      # wait for both fresh_ttl AND max_ttl to expire
+      Process.sleep(550)
+
+      # different data → :data_changed signal
+      {_data, _cursor, signal} =
+        CachedPaginator.get_or_create(cache, filters, fn -> ["id3", "id4", "id5"] end, cursor)
+
+      assert signal == :data_changed
+    end
+
+    test "no cursor never returns :data_changed", %{cache: cache} do
+      filters = [status: :active]
+
+      result = CachedPaginator.get_or_create(cache, filters, fn -> ["id1"] end)
+      assert {_data, _cursor} = result
+      assert tuple_size(result) == 2
+
+      # even with expired fresh cache
+      Process.sleep(150)
+      result2 = CachedPaginator.get_or_create(cache, filters, fn -> ["different"] end)
+      assert {_data, _cursor} = result2
+      assert tuple_size(result2) == 2
+    end
+
     test "concurrent requests wait for ongoing fetch", %{cache: cache} do
       filters = [status: :active]
       fetch_count = :counters.new(1, [:atomics])
@@ -178,7 +224,7 @@ defmodule CachedPaginatorTest do
     test "fetches range of ids from cache table", %{cache: cache} do
       filters = [status: :active]
       ids = ["a", "b", "c", "d", "e"]
-      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, filters, ids)
+      {{table, cache_key, _size}, _key, _rh} = CachedPaginator.store(cache, filters, ids)
 
       assert ["b", "c", "d"] == CachedPaginator.fetch_range(table, cache_key, 1, 3)
       assert ["a", "b"] == CachedPaginator.fetch_range(table, cache_key, 0, 1)
@@ -187,15 +233,15 @@ defmodule CachedPaginatorTest do
 
     test "handles out of bounds gracefully", %{cache: cache} do
       filters = [status: :active]
-      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, filters, ["a", "b"])
+      {{table, cache_key, _size}, _key, _rh} = CachedPaginator.store(cache, filters, ["a", "b"])
 
       assert ["b"] == CachedPaginator.fetch_range(table, cache_key, 1, 5)
       assert [] == CachedPaginator.fetch_range(table, cache_key, 10, 15)
     end
 
     test "multiple queries coexist in shared tables", %{cache: cache} do
-      {{table1, key1, _}, _} = CachedPaginator.store(cache, [a: 1], ["x", "y"])
-      {{table2, key2, _}, _} = CachedPaginator.store(cache, [b: 2], ["p", "q", "r"])
+      {{table1, key1, _}, _, _} = CachedPaginator.store(cache, [a: 1], ["x", "y"])
+      {{table2, key2, _}, _, _} = CachedPaginator.store(cache, [b: 2], ["p", "q", "r"])
 
       assert ["x", "y"] == CachedPaginator.fetch_range(table1, key1, 0, 1)
       assert ["p", "q", "r"] == CachedPaginator.fetch_range(table2, key2, 0, 2)
@@ -203,11 +249,21 @@ defmodule CachedPaginatorTest do
   end
 
   describe "cursor encoding/decoding" do
-    test "encode_cursor and decode_cursor are inverse operations" do
+    test "encode_cursor and decode_cursor round-trip with result_hash" do
       cache_key = {12345, 67890}
-      cursor = CachedPaginator.encode_cursor(cache_key)
+      result_hash = 99999
+      cursor = CachedPaginator.encode_cursor(cache_key, result_hash)
 
-      assert {:ok, ^cache_key} = CachedPaginator.decode_cursor(cursor)
+      assert {:ok, {12345, 67890, 99999}} = CachedPaginator.decode_cursor(cursor)
+    end
+
+    test "decode_cursor returns :error for legacy 2-tuple cursors" do
+      legacy_cursor =
+        {12345, 67890}
+        |> :erlang.term_to_binary()
+        |> Base.url_encode64(padding: false)
+
+      assert :error == CachedPaginator.decode_cursor(legacy_cursor)
     end
 
     test "decode_cursor returns :error for nil" do
@@ -225,8 +281,8 @@ defmodule CachedPaginatorTest do
       CachedPaginator.store(cache, [a: 1], ["id1"])
       CachedPaginator.store(cache, [b: 2], ["id2"])
 
-      assert {:ok, _, _} = CachedPaginator.get(cache, a: 1)
-      assert {:ok, _, _} = CachedPaginator.get(cache, b: 2)
+      assert {:ok, _, _, _} = CachedPaginator.get(cache, a: 1)
+      assert {:ok, _, _, _} = CachedPaginator.get(cache, b: 2)
 
       :ok = CachedPaginator.clear(cache)
 
@@ -242,7 +298,7 @@ defmodule CachedPaginatorTest do
 
       stats = CachedPaginator.stats(cache)
 
-      assert stats.pool_size == 10
+      assert stats.pool_size == 100
       assert is_integer(stats.memory_bytes)
       assert stats.memory_bytes > 0
     end
@@ -306,6 +362,32 @@ defmodule CachedPaginatorTest do
       CachedPaginator.get_or_create(cache, [a: 1], fn -> ["id1", "id2"] end)
 
       assert_receive {:store, %{count: 2, duration: _}, %{cache: ^cache}}, 1000
+
+      :telemetry.detach(ref)
+    end
+
+    test "emits data_changed event when data differs on expired cursor", %{cache: cache} do
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        ref,
+        [:cached_paginator, :data_changed],
+        fn _event, _measurements, metadata, _ ->
+          send(test_pid, {:data_changed, metadata})
+        end,
+        nil
+      )
+
+      filters = [a: 1]
+      {_data, cursor} = CachedPaginator.get_or_create(cache, filters, fn -> ["id1"] end)
+
+      # wait for max_ttl to expire
+      Process.sleep(550)
+
+      CachedPaginator.get_or_create(cache, filters, fn -> ["id2", "id3"] end, cursor)
+
+      assert_receive {:data_changed, %{cache: ^cache}}, 1000
 
       :telemetry.detach(ref)
     end
