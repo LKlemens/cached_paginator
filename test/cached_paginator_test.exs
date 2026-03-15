@@ -3,7 +3,7 @@ defmodule CachedPaginatorTest do
 
   setup do
     name = :"test_cache_#{:erlang.unique_integer([:positive])}"
-    {:ok, pid} = CachedPaginator.start_link(name: name, fresh_ttl: 100, max_ttl: 500)
+    {:ok, pid} = CachedPaginator.start_link(name: name, ttl: 100)
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
@@ -70,31 +70,6 @@ defmodule CachedPaginatorTest do
     end
   end
 
-  describe "get_by_cursor/3" do
-    test "returns cached data within max_ttl", %{cache: cache} do
-      filters = [status: :active]
-
-      {_data, cache_key} =
-        CachedPaginator.store(cache, filters, [{1, "id1"}, {2, "id2"}])
-
-      # wait past fresh_ttl but within max_ttl
-      Process.sleep(150)
-
-      assert {:ok, {_table, ^cache_key, 2}, ^cache_key} =
-               CachedPaginator.get_by_cursor(cache, cache_key)
-    end
-
-    test "returns :miss when cache exceeded max_ttl", %{cache: cache} do
-      filters = [status: :active]
-      {_data, cache_key} = CachedPaginator.store(cache, filters, [{1, "id1"}])
-
-      # wait for max_ttl (500ms) to expire
-      Process.sleep(550)
-
-      assert :miss == CachedPaginator.get_by_cursor(cache, cache_key)
-    end
-  end
-
   describe "get_or_create/5" do
     test "creates cache on miss", %{cache: cache} do
       filters = [status: :active]
@@ -134,8 +109,8 @@ defmodule CachedPaginatorTest do
       {_data, cursor} =
         CachedPaginator.get_or_create(cache, filters, fn -> [{1, "id1"}, {2, "id2"}] end)
 
-      # wait for both TTLs to expire
-      Process.sleep(550)
+      # wait for TTL to expire
+      Process.sleep(150)
 
       # different data — still just a 2-tuple
       result =
@@ -143,41 +118,6 @@ defmodule CachedPaginatorTest do
 
       assert {_data, _cursor} = result
       assert tuple_size(result) == 2
-    end
-
-    test "uses cursor for extended TTL", %{cache: cache} do
-      filters = [status: :active]
-      {_data, cursor} = CachedPaginator.get_or_create(cache, filters, fn -> [{1, "id1"}] end)
-
-      # wait past fresh_ttl (100ms)
-      Process.sleep(150)
-
-      # with cursor - should hit (within max_ttl)
-      {{_table, _cache_key, size}, _cursor} =
-        CachedPaginator.get_or_create(cache, filters, fn -> [{1, "new"}] end, cursor)
-
-      # should still get original data
-      assert size == 1
-    end
-
-    test "first_page: true ignores cursor and uses fresh_ttl", %{cache: cache} do
-      filters = [status: :active]
-      {_data, cursor} = CachedPaginator.get_or_create(cache, filters, fn -> [{1, "id1"}] end)
-
-      # wait past fresh_ttl
-      Process.sleep(150)
-
-      # with first_page: true, should fetch new data
-      {{_table, _cache_key, size}, _cursor} =
-        CachedPaginator.get_or_create(
-          cache,
-          filters,
-          fn -> [{1, "new1"}, {2, "new2"}] end,
-          cursor,
-          first_page: true
-        )
-
-      assert size == 2
     end
 
     test "expired cursor preserves last_sort_key for seamless continuation", %{cache: cache} do
@@ -191,8 +131,8 @@ defmodule CachedPaginatorTest do
       {fetched, cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, 2)
       assert fetched == ["a", "b"]
 
-      # Wait for both TTLs to expire
-      Process.sleep(550)
+      # Wait for TTL to expire
+      Process.sleep(150)
 
       # New data with same sort keys — cursor's last_sort_key preserved
       new_items = [{1, "a"}, {2, "b"}, {3, "c"}, {4, "d"}, {5, "e"}]

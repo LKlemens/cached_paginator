@@ -13,9 +13,7 @@ defmodule CachedPaginator do
 
   - **Query caching**: Run expensive query once, serve all page requests from cache
   - **Locking**: Concurrent requests for same data wait for ongoing query
-  - **Keyset pagination**: Cursor encodes last sort key, stable across snapshot transitions
-  - **Two-tier TTL**: Fresh data for new sessions, extended TTL for ongoing pagination
-  - **Pre-initialized pool**: Fixed number of ETS tables created at startup, zero runtime allocation
+  - **Keyset pagination**: Cursor encodes last sort key, stable across cache transitions
   - **Telemetry**: Full observability (hits, misses, table count, memory usage)
 
   ## Data Format
@@ -45,19 +43,11 @@ defmodule CachedPaginator do
       {table, cache_key, size} = data
       {items, updated_cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, 20)
 
-  ## TTL Rules
-
-  | Access Type                      | TTL        | Purpose                        |
-  |----------------------------------|------------|--------------------------------|
-  | No cursor OR first_page          | fresh_ttl  | Fresh data for new sessions    |
-  | With cursor, not first_page      | max_ttl    | Session can continue           |
-
   ## Configuration
 
       CachedPaginator.start_link(
         name: :my_cache,           # required
-        fresh_ttl: 300,            # ms, default: 300
-        max_ttl: 10_000,           # ms, default: 10_000
+        ttl: 300,                  # ms, default: 300
         sweep_interval: 5_000,     # ms, default: 5_000
         pool_size: 100             # default: 100
       )
@@ -67,8 +57,7 @@ defmodule CachedPaginator do
 
   require Logger
 
-  @default_fresh_ttl 300
-  @default_max_ttl 10_000
+  @default_ttl 500
   @default_sweep_interval 5_000
   @default_pool_size 100
   @wait_poll_interval 50
@@ -88,8 +77,7 @@ defmodule CachedPaginator do
   ## Options
 
   - `:name` (required) - The name to register the GenServer
-  - `:fresh_ttl` - TTL in ms for fresh cache entries (default: 300)
-  - `:max_ttl` - TTL in ms for cursor-based access (default: 10_000)
+  - `:ttl` - TTL in ms for cache entries (default: 300)
   - `:sweep_interval` - Interval in ms for cleanup sweep (default: 5_000)
   - `:pool_size` - Number of pre-initialized ETS tables (default: 100)
   """
@@ -114,49 +102,22 @@ defmodule CachedPaginator do
   @doc """
   Get cached data or create it if missing, with cursor-based session support.
 
-  ## Options
-
-  - `:first_page` - when true, ignores cursor and uses fresh TTL.
-    Use for page 1 requests to ensure users get fresh data on restart.
-
-  ## TTL Behavior
-
-  - `first_page: true` → uses fresh TTL
-  - cursor matches filters, not first page → uses max TTL
-  - no cursor or mismatch → uses fresh TTL
-
   ## Return Value
 
   Returns `{cache_data, cursor}`.
 
   The cursor encodes the last sort key from previous `fetch_after` calls. When the
   underlying data changes (cache miss), the last sort key is preserved in the new
-  cursor so keyset pagination continues seamlessly in the new snapshot.
+  cursor so keyset pagination continues seamlessly.
   """
-  @spec get_or_create(name(), filters(), (-> [tuple()]), cursor() | nil, keyword()) ::
+  @spec get_or_create(name(), filters(), (-> [tuple()]), cursor() | nil) ::
           {cache_data(), cursor()}
-  def get_or_create(name, filters, fetch_fn, cursor \\ nil, opts \\ []) do
+  def get_or_create(name, filters, fetch_fn, cursor \\ nil) do
     config = get_config(name)
     filter_hash = :erlang.phash2(filters)
-    first_page = Keyword.get(opts, :first_page, false)
-
     decoded_cursor = decode_cursor(cursor)
 
-    result =
-      case {decoded_cursor, first_page} do
-        {_, true} ->
-          get(name, filters, config)
-
-        {{:ok, cursor_tuple}, false}
-        when elem(cursor_tuple, 0) == filter_hash ->
-          cursor_key = extract_cache_key(decoded_cursor)
-          get_by_cursor(name, cursor_key, config)
-
-        _ ->
-          get(name, filters, config)
-      end
-
-    case result do
+    case get(name, filters, config) do
       {:ok, data, cache_key} ->
         CachedPaginator.Telemetry.emit_hit(name, filter_hash)
         last_sort_key = extract_last_sort_key(decoded_cursor)
@@ -175,32 +136,9 @@ defmodule CachedPaginator do
   end
 
   @doc """
-  Get cached data by cursor. Checks max TTL.
-
-  Direct ETS read using composite key - no GenServer call.
-  Returns :miss if cache is older than max TTL.
-  """
-  @spec get_by_cursor(name(), cache_key(), map()) ::
-          {:ok, cache_data(), cache_key()} | :miss
-  def get_by_cursor(name, {filter_hash, created_at} = key, config \\ nil)
-      when is_integer(filter_hash) and is_integer(created_at) do
-    config = config || get_config(name)
-    now = System.monotonic_time(:millisecond)
-
-    case :ets.lookup(config.registry, key) do
-      [{^key, table, size}] when now - created_at <= config.max_ttl ->
-        {:ok, {table, key, size}, key}
-
-      _ ->
-        :miss
-    end
-  end
-
-  @doc """
   Get indexed data for filters. Direct ETS read - no GenServer call.
 
-  Uses latest_index for O(1) lookup. Returns fresh cache (< fresh_ttl old).
-  Use for first page / new session requests.
+  Uses latest_index for O(1) lookup. Returns cached data within TTL.
   """
   @spec get(name(), filters(), map()) ::
           {:ok, cache_data(), cache_key()} | :miss
@@ -211,7 +149,7 @@ defmodule CachedPaginator do
 
     case :ets.lookup(config.latest_index, filter_hash) do
       [{^filter_hash, created_at, table, size}]
-      when now - created_at <= config.fresh_ttl ->
+      when now - created_at <= config.ttl ->
         {:ok, {table, {filter_hash, created_at}, size}, {filter_hash, created_at}}
 
       _ ->
@@ -310,9 +248,6 @@ defmodule CachedPaginator do
     :persistent_term.get({__MODULE__, name, :config})
   end
 
-  defp extract_cache_key({:ok, {filter_hash, created_at, _last_sort_key}}),
-    do: {filter_hash, created_at}
-
   defp extract_last_sort_key({:ok, {_, _, last_sort_key}}), do: last_sort_key
   defp extract_last_sort_key(_), do: nil
 
@@ -379,8 +314,7 @@ defmodule CachedPaginator do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    fresh_ttl = Keyword.get(opts, :fresh_ttl, @default_fresh_ttl)
-    max_ttl = Keyword.get(opts, :max_ttl, @default_max_ttl)
+    ttl = Keyword.get(opts, :ttl, @default_ttl)
     sweep_interval = Keyword.get(opts, :sweep_interval, @default_sweep_interval)
     pool_size = Keyword.get(opts, :pool_size, @default_pool_size)
 
@@ -404,8 +338,7 @@ defmodule CachedPaginator do
       registry: registry,
       latest_index: latest_index,
       locks: locks,
-      fresh_ttl: fresh_ttl,
-      max_ttl: max_ttl,
+      ttl: ttl,
       pool_size: pool_size
     }
 
@@ -461,7 +394,7 @@ defmodule CachedPaginator do
     %{config: config, pool: pool, sweep_interval: sweep_interval} = state
 
     now = System.monotonic_time(:millisecond)
-    expired = collect_expired(config.registry, config.max_ttl, now)
+    expired = collect_expired(config.registry, config.ttl, now)
 
     Enum.each(expired, fn {{filter_hash, created_at} = key, table} ->
       :ets.delete(config.registry, key)
