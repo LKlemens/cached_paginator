@@ -13,7 +13,7 @@ defmodule CachedPaginatorTest do
   end
 
   describe "store/3" do
-    test "stores tuple items and returns cache_data and cache_key", %{cache: cache} do
+    test "stores tuple items and returns cache_location and cache_key", %{cache: cache} do
       filters = [status: :active]
       items = [{1, "id1"}, {2, "id2"}, {3, "id3"}]
 

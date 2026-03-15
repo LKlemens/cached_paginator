@@ -33,14 +33,14 @@ defmodule CachedPaginator do
       CachedPaginator.start_link(name: :my_cache)
 
       # Cache query results and paginate
-      {data, cursor} = CachedPaginator.get_or_create(:my_cache, filters, fn ->
+      {cache_location, cursor} = CachedPaginator.get_or_create(:my_cache, filters, fn ->
         # expensive query — return list of {sort_key, value} tuples
         # e.g select(query, [m], {m.start_time, m.id})
         MyRepo.all(query)
       end)
 
       # Fetch a page using keyset cursor
-      {table, cache_key, size} = data
+      {table, cache_key, size} = cache_location
       {items, updated_cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, 20)
 
   ## Configuration
@@ -66,7 +66,7 @@ defmodule CachedPaginator do
   @type cache_key :: {filter_hash :: non_neg_integer(), created_at :: integer()}
   @type cursor :: binary()
   @type table_ref :: :ets.tid()
-  @type cache_data :: {table_ref(), cache_key(), non_neg_integer()}
+  @type cache_location :: {table_ref(), cache_key(), non_neg_integer()}
   @type name :: GenServer.name()
 
   # API
@@ -89,12 +89,12 @@ defmodule CachedPaginator do
 
   @doc """
   Store indexed data. Always creates a new cache entry with current timestamp.
-  Returns cache_data and cache_key.
+  Returns cache_location and cache_key.
 
   Items must be tuples where the last element is the value and preceding elements
   form the sort key.
   """
-  @spec store(name(), filters(), [tuple()]) :: {cache_data(), cache_key()}
+  @spec store(name(), filters(), [tuple()]) :: {cache_location(), cache_key()}
   def store(name, filters, items) do
     GenServer.call(name, {:store, filters, items})
   end
@@ -104,20 +104,20 @@ defmodule CachedPaginator do
 
   ## Return Value
 
-  Returns `{cache_data, cursor}`.
+  Returns `{cache_location, cursor}`.
 
   The cursor encodes the last sort key from previous `fetch_after` calls. When the
   underlying data changes (cache miss), the last sort key is preserved in the new
   cursor so keyset pagination continues seamlessly.
   """
   @spec get_or_create(name(), filters(), (-> [tuple()]), cursor() | nil) ::
-          {cache_data(), cursor()}
+          {cache_location(), cursor()}
   def get_or_create(name, filters, fetch_fn, cursor \\ nil) do
     config = get_config(name)
     filter_hash = :erlang.phash2(filters)
     decoded_cursor = decode_cursor(cursor)
 
-    case get(name, filters, config) do
+    case get(name, filters) do
       {:ok, data, cache_key} ->
         CachedPaginator.Telemetry.emit_hit(name, filter_hash)
         last_sort_key = extract_last_sort_key(decoded_cursor)
@@ -140,10 +140,10 @@ defmodule CachedPaginator do
 
   Uses latest_index for O(1) lookup. Returns cached data within TTL.
   """
-  @spec get(name(), filters(), map()) ::
-          {:ok, cache_data(), cache_key()} | :miss
-  def get(name, filters, config \\ nil) do
-    config = config || get_config(name)
+  @spec get(name(), filters()) ::
+          {:ok, cache_location(), cache_key()} | :miss
+  def get(name, filters) do
+    config = get_config(name)
     filter_hash = :erlang.phash2(filters)
     now = System.monotonic_time(:millisecond)
 
@@ -296,7 +296,7 @@ defmodule CachedPaginator do
     else
       Process.sleep(@wait_poll_interval)
 
-      case get(name, filters, config) do
+      case get(name, filters) do
         {:ok, data, cache_key} -> {data, cache_key}
         :miss -> locked_fetch_and_store(name, filters, fetch_fn, config)
       end
@@ -323,11 +323,14 @@ defmodule CachedPaginator do
     latest_index = :"#{name}_latest_index"
     locks = :"#{name}_locks"
 
+    # all cache entries for expiration sweep: {cache_key, table, size}
     :ets.new(registry, [:set, :public, :named_table, read_concurrency: true])
+    # O(1) lookup for most recent entry per filter: {filter_hash, created_at, table, size}
     :ets.new(latest_index, [:set, :public, :named_table, read_concurrency: true])
+    # mutex for deduplicating concurrent fetches: {filter_hash, true}
     :ets.new(locks, [:set, :public, :named_table])
 
-    # pre-initialize pool of shared ordered_set ETS tables
+    # pool of shared ordered_set tables holding cached data: {{cache_key, sort_key}, value}
     pool =
       for i <- 1..pool_size do
         :ets.new(:"#{name}_data_#{i}", [:ordered_set, :public, read_concurrency: true])
