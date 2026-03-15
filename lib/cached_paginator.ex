@@ -1,22 +1,33 @@
 defmodule CachedPaginator do
   @moduledoc """
-  ETS-backed pagination cache with cursor support.
+  ETS-backed pagination cache with keyset cursor support.
 
   Cache expensive query results once, paginate efficiently with stable cursors.
   Multiple users requesting the same data share the cached result, avoiding
   repeated expensive queries.
 
-  Uses a pre-initialized pool of shared ETS tables. Multiple query results
-  coexist in each table using composite keys `{cache_key, index}`.
+  Uses a pre-initialized pool of shared ETS `ordered_set` tables. Multiple query
+  results coexist in each table using composite keys `{cache_key, sort_key}`.
 
   ## Features
 
   - **Query caching**: Run expensive query once, serve all page requests from cache
   - **Locking**: Concurrent requests for same data wait for ongoing query
-  - **Cursor stability**: Same result set across all pages during session
+  - **Keyset pagination**: Cursor encodes last sort key, stable across snapshot transitions
   - **Two-tier TTL**: Fresh data for new sessions, extended TTL for ongoing pagination
   - **Pre-initialized pool**: Fixed number of ETS tables created at startup, zero runtime allocation
   - **Telemetry**: Full observability (hits, misses, table count, memory usage)
+
+  ## Data Format
+
+  Items must be tuples where the last element is the value and all preceding
+  elements form the composite sort key:
+
+      # Single sort key:
+      {sort_key, value}
+
+      # Composite sort key:
+      {sort_key1, sort_key2, value}
 
   ## Usage
 
@@ -25,13 +36,14 @@ defmodule CachedPaginator do
 
       # Cache query results and paginate
       {data, cursor} = CachedPaginator.get_or_create(:my_cache, filters, fn ->
-        # expensive query
+        # expensive query — return list of {sort_key, value} tuples
+        # e.g select(query, [m], {m.start_time, m.id})
         MyRepo.all(query)
       end)
 
-      # Fetch a page range
+      # Fetch a page using keyset cursor
       {table, cache_key, size} = data
-      ids = CachedPaginator.fetch_range(table, cache_key, 0, 19)
+      {items, updated_cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, 20)
 
   ## TTL Rules
 
@@ -63,7 +75,6 @@ defmodule CachedPaginator do
 
   @type filters :: term()
   @type cache_key :: {filter_hash :: non_neg_integer(), created_at :: integer()}
-  @type result_hash :: non_neg_integer()
   @type cursor :: binary()
   @type table_ref :: :ets.tid()
   @type cache_data :: {table_ref(), cache_key(), non_neg_integer()}
@@ -90,11 +101,14 @@ defmodule CachedPaginator do
 
   @doc """
   Store indexed data. Always creates a new cache entry with current timestamp.
-  Returns cache_data, cache_key, and result_hash.
+  Returns cache_data and cache_key.
+
+  Items must be tuples where the last element is the value and preceding elements
+  form the sort key.
   """
-  @spec store(name(), filters(), [term()]) :: {cache_data(), cache_key(), result_hash()}
-  def store(name, filters, ids) do
-    GenServer.call(name, {:store, filters, ids})
+  @spec store(name(), filters(), [tuple()]) :: {cache_data(), cache_key()}
+  def store(name, filters, items) do
+    GenServer.call(name, {:store, filters, items})
   end
 
   @doc """
@@ -113,14 +127,14 @@ defmodule CachedPaginator do
 
   ## Return Value
 
-  - `{cache_data, cursor}` — cache hit or fresh miss (no prior data to compare)
-  - `{cache_data, cursor, :data_changed}` — cursor expired and fresh data differs from cached
+  Returns `{cache_data, cursor}`.
 
-  The `:data_changed` signal tells clients the underlying data changed since their
-  cursor was issued. Clients should prompt the user to restart from page 1.
+  The cursor encodes the last sort key from previous `fetch_after` calls. When the
+  underlying data changes (cache miss), the last sort key is preserved in the new
+  cursor so keyset pagination continues seamlessly in the new snapshot.
   """
-  @spec get_or_create(name(), filters(), (-> [term()]), cursor() | nil, keyword()) ::
-          {cache_data(), cursor()} | {cache_data(), cursor(), :data_changed}
+  @spec get_or_create(name(), filters(), (-> [tuple()]), cursor() | nil, keyword()) ::
+          {cache_data(), cursor()}
   def get_or_create(name, filters, fetch_fn, cursor \\ nil, opts \\ []) do
     config = get_config(name)
     filter_hash = :erlang.phash2(filters)
@@ -143,25 +157,20 @@ defmodule CachedPaginator do
       end
 
     case result do
-      {:ok, data, cache_key, result_hash} ->
+      {:ok, data, cache_key} ->
         CachedPaginator.Telemetry.emit_hit(name, filter_hash)
-        {data, encode_cursor(cache_key, result_hash)}
+        last_sort_key = extract_last_sort_key(decoded_cursor)
+        {data, encode_cursor(cache_key, last_sort_key)}
 
       :miss ->
         CachedPaginator.Telemetry.emit_miss(name, filter_hash)
-        old_result_hash = if first_page, do: nil, else: extract_result_hash(decoded_cursor)
+        last_sort_key = extract_last_sort_key(decoded_cursor)
 
-        {data, cache_key, new_result_hash} =
+        {data, cache_key} =
           locked_fetch_and_store(name, filters, fetch_fn, config)
 
-        new_cursor = encode_cursor(cache_key, new_result_hash)
-
-        if old_result_hash != nil and old_result_hash != new_result_hash do
-          CachedPaginator.Telemetry.emit_data_changed(name, filter_hash)
-          {data, new_cursor, :data_changed}
-        else
-          {data, new_cursor}
-        end
+        new_cursor = encode_cursor(cache_key, last_sort_key)
+        {data, new_cursor}
     end
   end
 
@@ -172,15 +181,15 @@ defmodule CachedPaginator do
   Returns :miss if cache is older than max TTL.
   """
   @spec get_by_cursor(name(), cache_key(), map()) ::
-          {:ok, cache_data(), cache_key(), result_hash()} | :miss
+          {:ok, cache_data(), cache_key()} | :miss
   def get_by_cursor(name, {filter_hash, created_at} = key, config \\ nil)
       when is_integer(filter_hash) and is_integer(created_at) do
     config = config || get_config(name)
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(config.registry, key) do
-      [{^key, table, size, result_hash}] when now - created_at <= config.max_ttl ->
-        {:ok, {table, key, size}, key, result_hash}
+      [{^key, table, size}] when now - created_at <= config.max_ttl ->
+        {:ok, {table, key, size}, key}
 
       _ ->
         :miss
@@ -194,16 +203,16 @@ defmodule CachedPaginator do
   Use for first page / new session requests.
   """
   @spec get(name(), filters(), map()) ::
-          {:ok, cache_data(), cache_key(), result_hash()} | :miss
+          {:ok, cache_data(), cache_key()} | :miss
   def get(name, filters, config \\ nil) do
     config = config || get_config(name)
     filter_hash = :erlang.phash2(filters)
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(config.latest_index, filter_hash) do
-      [{^filter_hash, created_at, table, size, result_hash}]
+      [{^filter_hash, created_at, table, size}]
       when now - created_at <= config.fresh_ttl ->
-        {:ok, {table, {filter_hash, created_at}, size}, {filter_hash, created_at}, result_hash}
+        {:ok, {table, {filter_hash, created_at}, size}, {filter_hash, created_at}}
 
       _ ->
         :miss
@@ -219,38 +228,55 @@ defmodule CachedPaginator do
   end
 
   @doc """
-  Fetch a range of IDs from the cache table using direct key lookup.
-  This is O(page_size) regardless of table size or position.
+  Fetch items after the cursor's last sort key using keyset pagination.
 
-  Requires the `cache_key` to identify which query's data to read from the shared table.
+  Walks the ordered ETS table from the last sort key encoded in the cursor,
+  collecting up to `limit` items. Returns the items and an updated cursor
+  with the new last sort key.
+
+  ## Examples
+
+      {items, updated_cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, 20)
   """
-  @spec fetch_range(table_ref(), cache_key(), non_neg_integer(), non_neg_integer()) :: [term()]
-  def fetch_range(table, cache_key, start_idx, end_idx) do
-    Enum.reduce(end_idx..start_idx//-1, [], fn idx, acc ->
-      case :ets.lookup(table, {cache_key, idx}) do
-        [{_, id}] -> [id | acc]
-        [] -> acc
+  @spec fetch_after(table_ref(), cache_key(), cursor(), non_neg_integer()) ::
+          {[term()], cursor()}
+  def fetch_after(table, cache_key, cursor, limit) do
+    decoded = decode_cursor(cursor)
+    last_sort_key = extract_last_sort_key(decoded)
+
+    start_key =
+      if last_sort_key do
+        {cache_key, last_sort_key}
+      else
+        # Position just before the first item for this cache_key.
+        # In Erlang term ordering, a bare tuple {cache_key} is smaller than
+        # any {cache_key, sort_key} tuple since shorter tuples sort first.
+        {cache_key}
       end
-    end)
+
+    {values, new_last_sk} = collect_next(table, start_key, cache_key, limit, [], nil)
+
+    updated_cursor = update_cursor_sort_key(decoded, new_last_sk)
+    {values, updated_cursor}
   end
 
   @doc """
-  Encodes a cache key and result hash into a cursor string.
+  Encodes a cache key and last_sort_key into a cursor string.
   """
-  @spec encode_cursor(cache_key(), result_hash()) :: cursor()
-  def encode_cursor({filter_hash, created_at}, result_hash) do
-    {filter_hash, created_at, result_hash}
+  @spec encode_cursor(cache_key(), term()) :: cursor()
+  def encode_cursor({filter_hash, created_at}, last_sort_key) do
+    {filter_hash, created_at, last_sort_key}
     |> :erlang.term_to_binary()
     |> Base.url_encode64(padding: false)
   end
 
   @doc """
-  Decodes a cursor string into a cache key tuple.
+  Decodes a cursor string into a 3-tuple.
 
-  Returns `{:ok, {filter_hash, created_at, result_hash}}` or `:error`.
+  Returns `{:ok, {filter_hash, created_at, last_sort_key}}` or `:error`.
   """
   @spec decode_cursor(cursor() | nil) ::
-          {:ok, {non_neg_integer(), integer(), non_neg_integer()}}
+          {:ok, {non_neg_integer(), integer(), term()}}
           | :error
   def decode_cursor(nil), do: :error
 
@@ -258,9 +284,9 @@ defmodule CachedPaginator do
     with {:ok, binary} <- Base.url_decode64(cursor, padding: false),
          {:ok, term} <- safe_binary_to_term(binary) do
       case term do
-        {filter_hash, created_at, result_hash}
-        when is_integer(filter_hash) and is_integer(created_at) and is_integer(result_hash) ->
-          {:ok, {filter_hash, created_at, result_hash}}
+        {filter_hash, created_at, last_sort_key}
+        when is_integer(filter_hash) and is_integer(created_at) ->
+          {:ok, {filter_hash, created_at, last_sort_key}}
 
         _ ->
           :error
@@ -284,11 +310,39 @@ defmodule CachedPaginator do
     :persistent_term.get({__MODULE__, name, :config})
   end
 
-  defp extract_cache_key({:ok, {filter_hash, created_at, _result_hash}}),
+  defp extract_cache_key({:ok, {filter_hash, created_at, _last_sort_key}}),
     do: {filter_hash, created_at}
 
-  defp extract_result_hash({:ok, {_, _, result_hash}}), do: result_hash
-  defp extract_result_hash(_), do: nil
+  defp extract_last_sort_key({:ok, {_, _, last_sort_key}}), do: last_sort_key
+  defp extract_last_sort_key(_), do: nil
+
+  defp update_cursor_sort_key({:ok, {filter_hash, created_at, _old_sk}}, new_sk) do
+    encode_cursor({filter_hash, created_at}, new_sk)
+  end
+
+  defp update_cursor_sort_key(:error, _new_sk), do: nil
+
+  # Walks the ordered_set ETS table from `current_key` using `:ets.next/2`,
+  # collecting up to `remaining` items that belong to `cache_key`.
+  # Items are prepended to the accumulator (O(1) per item) and reversed at the
+  # end, which is more efficient than appending or scanning the whole table
+  # with `:ets.select/3`.
+  defp collect_next(_table, _key, _cache_key, 0, acc, last_sk),
+    do: {Enum.reverse(acc), last_sk}
+
+  defp collect_next(table, current_key, cache_key, remaining, acc, _last_sk) do
+    case :ets.next(table, current_key) do
+      :"$end_of_table" ->
+        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+
+      {^cache_key, sort_key} = next_key ->
+        [{_, value}] = :ets.lookup(table, next_key)
+        collect_next(table, next_key, cache_key, remaining - 1, [value | acc], sort_key)
+
+      _other_cache_key ->
+        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+    end
+  end
 
   defp locked_fetch_and_store(name, filters, fetch_fn, config) do
     filter_hash = :erlang.phash2(filters)
@@ -296,11 +350,11 @@ defmodule CachedPaginator do
     if :ets.insert_new(config.locks, {filter_hash, true}) do
       try do
         start_time = System.monotonic_time()
-        ids = fetch_fn.()
+        items = fetch_fn.()
         duration = System.monotonic_time() - start_time
 
-        CachedPaginator.Telemetry.emit_store(name, filter_hash, length(ids), duration)
-        store(name, filters, ids)
+        CachedPaginator.Telemetry.emit_store(name, filter_hash, length(items), duration)
+        store(name, filters, items)
       after
         :ets.delete(config.locks, filter_hash)
       end
@@ -308,7 +362,7 @@ defmodule CachedPaginator do
       Process.sleep(@wait_poll_interval)
 
       case get(name, filters, config) do
-        {:ok, data, cache_key, result_hash} -> {data, cache_key, result_hash}
+        {:ok, data, cache_key} -> {data, cache_key}
         :miss -> locked_fetch_and_store(name, filters, fetch_fn, config)
       end
     end
@@ -339,10 +393,10 @@ defmodule CachedPaginator do
     :ets.new(latest_index, [:set, :public, :named_table, read_concurrency: true])
     :ets.new(locks, [:set, :public, :named_table])
 
-    # pre-initialize pool of shared ETS tables
+    # pre-initialize pool of shared ordered_set ETS tables
     pool =
       for i <- 1..pool_size do
-        :ets.new(:"#{name}_data_#{i}", [:set, :public, read_concurrency: true])
+        :ets.new(:"#{name}_data_#{i}", [:ordered_set, :public, read_concurrency: true])
       end
 
     config = %{
@@ -370,8 +424,8 @@ defmodule CachedPaginator do
   end
 
   @impl true
-  def handle_call({:store, filters, ids}, _from, state) do
-    {result, new_state} = do_store(filters, ids, state)
+  def handle_call({:store, filters, items}, _from, state) do
+    {result, new_state} = do_store(filters, items, state)
     {:reply, result, new_state}
   end
 
@@ -414,7 +468,7 @@ defmodule CachedPaginator do
       :ets.match_delete(table, {{key, :_}, :_})
 
       case :ets.lookup(config.latest_index, filter_hash) do
-        [{^filter_hash, ^created_at, _, _, _}] ->
+        [{^filter_hash, ^created_at, _, _}] ->
           :ets.delete(config.latest_index, filter_hash)
 
         _ ->
@@ -435,11 +489,10 @@ defmodule CachedPaginator do
     {:noreply, state}
   end
 
-  defp do_store(filters, ids, state) do
+  defp do_store(filters, items, state) do
     %{config: config, pool: pool, next_table: next_table} = state
 
     filter_hash = :erlang.phash2(filters)
-    result_hash = :erlang.phash2(ids)
     now = System.monotonic_time(:millisecond)
     cache_key = {filter_hash, now}
 
@@ -447,12 +500,12 @@ defmodule CachedPaginator do
     table = Enum.at(pool, next_table)
     new_next = rem(next_table + 1, config.pool_size)
 
-    size = populate_table(table, cache_key, ids)
+    size = populate_table(table, cache_key, items)
 
-    :ets.insert(config.registry, {cache_key, table, size, result_hash})
-    :ets.insert(config.latest_index, {filter_hash, now, table, size, result_hash})
+    :ets.insert(config.registry, {cache_key, table, size})
+    :ets.insert(config.latest_index, {filter_hash, now, table, size})
 
-    result = {{table, cache_key, size}, cache_key, result_hash}
+    result = {{table, cache_key, size}, cache_key}
     new_state = %{state | next_table: new_next}
 
     {result, new_state}
@@ -464,7 +517,7 @@ defmodule CachedPaginator do
 
   defp collect_expired(registry, max_ttl, now) do
     :ets.foldl(
-      fn {{_filter_hash, created_at} = key, table, _size, _result_hash}, acc ->
+      fn {{_filter_hash, created_at} = key, table, _size}, acc ->
         if now - created_at > max_ttl do
           [{key, table} | acc]
         else
@@ -476,10 +529,16 @@ defmodule CachedPaginator do
     )
   end
 
-  defp populate_table(table, cache_key, ids) do
-    entries = Enum.with_index(ids, fn id, idx -> {{cache_key, idx}, id} end)
+  defp populate_table(table, cache_key, items) do
+    entries =
+      Enum.map(items, fn item ->
+        sort_key = Tuple.delete_at(item, tuple_size(item) - 1)
+        value = elem(item, tuple_size(item) - 1)
+        {{cache_key, sort_key}, value}
+      end)
+
     :ets.insert(table, entries)
-    length(ids)
+    length(items)
   end
 
   defp calculate_memory(pool) do
