@@ -53,6 +53,93 @@ defmodule CachedPaginator do
       )
   """
 
+  @doc """
+  Injects wrapper functions with the cache name pre-filled.
+
+  Reads configuration from application env at startup, merged with runtime opts.
+
+  ## Usage
+
+      defmodule MyApp.PaginationCache do
+        use CachedPaginator, otp_app: :my_app
+      end
+
+  Config in `config/config.exs`:
+
+      config :my_app, MyApp.PaginationCache,
+        ttl: 300,
+        sweep_interval: 5_000,
+        pool_size: 100
+
+  ## Injected Functions
+
+  - `start_link/1` — starts the cache, merging app env + runtime opts
+  - `child_spec/1` — for supervision tree placement
+  - `get/1` — lookup by filters
+  - `get_or_create/2,3` — cache-through with optional cursor
+  - `store/2` — store items for filters
+  - `clear/0` — clear all cached data
+  - `stats/0` — memory and pool stats
+  - `fetch_after/4`, `encode_cursor/2`, `decode_cursor/1` — delegated directly
+  """
+  defmacro __using__(opts) do
+    otp_app = Keyword.fetch!(opts, :otp_app)
+
+    quote do
+      @otp_app unquote(otp_app)
+
+      @spec start_link(keyword()) :: GenServer.on_start()
+      def start_link(opts \\ []) do
+        app_config = Application.get_env(@otp_app, __MODULE__, [])
+
+        merged =
+          app_config
+          |> Keyword.merge(opts)
+          |> Keyword.put_new(:name, __MODULE__)
+
+        CachedPaginator.start_link(merged)
+      end
+
+      def child_spec(opts) do
+        %{
+          id: __MODULE__,
+          start: {__MODULE__, :start_link, [opts]},
+          type: :worker
+        }
+      end
+
+      @spec get(CachedPaginator.filters()) ::
+              {:ok, CachedPaginator.cache_location(), CachedPaginator.cache_key()} | :miss
+      def get(filters), do: CachedPaginator.get(__MODULE__, filters)
+
+      @spec get_or_create(CachedPaginator.filters(), (-> [tuple()])) ::
+              {CachedPaginator.cache_location(), CachedPaginator.cursor()}
+      def get_or_create(filters, fetch_fn),
+        do: CachedPaginator.get_or_create(__MODULE__, filters, fetch_fn)
+
+      @spec get_or_create(CachedPaginator.filters(), (-> [tuple()]), CachedPaginator.cursor() | nil) ::
+              {CachedPaginator.cache_location(), CachedPaginator.cursor()}
+      def get_or_create(filters, fetch_fn, cursor),
+        do: CachedPaginator.get_or_create(__MODULE__, filters, fetch_fn, cursor)
+
+      @spec store(CachedPaginator.filters(), [tuple()]) ::
+              {CachedPaginator.cache_location(), CachedPaginator.cache_key()}
+      def store(filters, items), do: CachedPaginator.store(__MODULE__, filters, items)
+
+      @spec clear() :: :ok
+      def clear, do: CachedPaginator.clear(__MODULE__)
+
+      @spec stats() :: map()
+      def stats, do: CachedPaginator.stats(__MODULE__)
+
+      defdelegate fetch_after(table, cache_key, cursor, limit), to: CachedPaginator
+      defdelegate encode_cursor(cache_key, last_sort_key), to: CachedPaginator
+      defdelegate decode_cursor(cursor), to: CachedPaginator
+
+      defoverridable start_link: 1, child_spec: 1
+    end
+  end
+
   use GenServer
 
   require Logger

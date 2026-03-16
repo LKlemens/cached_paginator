@@ -48,21 +48,35 @@ end
 
 ## Usage
 
-### Start a cache instance
+### Define a cache module
 
 ```elixir
-# In your supervision tree
-children = [
-  {CachedPaginator, name: :my_cache}
-]
+defmodule MyApp.PaginationCache do
+  use CachedPaginator, otp_app: :my_app
+end
+```
 
-# Or with custom options
-{CachedPaginator,
-  name: :my_cache,
-  ttl: 500,              # ms - cache entry TTL
-  sweep_interval: 5_000, # ms - cleanup interval
-  pool_size: 100         # pre-initialized ETS tables
-}
+Configure in `config/config.exs`:
+
+```elixir
+config :my_app, MyApp.PaginationCache,
+  ttl: 300,
+  sweep_interval: 5_000,
+  pool_size: 100
+```
+
+Add to your supervision tree:
+
+```elixir
+children = [
+  MyApp.PaginationCache
+]
+```
+
+Runtime opts passed to `start_link/1` override app config:
+
+```elixir
+MyApp.PaginationCache.start_link(ttl: 1_000)
 ```
 
 ### Cache and paginate
@@ -70,16 +84,30 @@ children = [
 ```elixir
 def list_items(filters, cursor, page_size) do
   {cache_location, cursor} =
-    CachedPaginator.get_or_create(:my_cache, filters, fn ->
+    MyApp.PaginationCache.get_or_create(filters, fn ->
       # return {sort_key, value} tuples
       Repo.all(from i in Item, where: ^filters, select: {i.inserted_at, i.id})
     end, cursor)
 
   {table, cache_key, _size} = cache_location
-  {items, updated_cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, page_size)
+  {items, updated_cursor} = MyApp.PaginationCache.fetch_after(table, cache_key, cursor, page_size)
 
   %{items: items, cursor: updated_cursor}
 end
+```
+
+### Direct usage (without `use`)
+
+You can also use `CachedPaginator` directly without a wrapper module:
+
+```elixir
+# In your supervision tree
+children = [
+  {CachedPaginator, name: :my_cache, ttl: 500}
+]
+
+# Call with explicit name
+CachedPaginator.get_or_create(:my_cache, filters, &fetch/0, cursor)
 ```
 
 ## How It Works
@@ -127,10 +155,12 @@ Tables are pre-initialized at startup and assigned to new cache entries via roun
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `:name` | required | GenServer name for this instance |
+| `:name` | required (auto-set by `use`) | GenServer name for this instance |
 | `:ttl` | 500 | Cache entry TTL (ms) |
 | `:sweep_interval` | 5_000 | Cleanup interval (ms) |
 | `:pool_size` | 100 | Pre-initialized ETS tables |
+
+When using `use CachedPaginator, otp_app: :my_app`, config is resolved in order: defaults → app env → runtime opts.
 
 ## License
 
