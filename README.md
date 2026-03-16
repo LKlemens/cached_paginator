@@ -29,9 +29,9 @@ User C: GET /items?filters=X&page=1  → O(1) ETS lookup, no query
 
 - **Query caching**: Run expensive query once, serve all page requests from cache
 - **Locking**: When User A triggers a query, Users B and C wait for it to complete and reuse the same result (no thundering herd)
-- **Cursor stability**: Users get consistent result sets across all pages during their session (no drift from concurrent inserts/deletes)
-- **Two-tier TTL**: Fresh data (300ms) for new sessions, extended TTL (10s) for ongoing pagination
-- **Backpressure**: Max tables limit prevents unbounded memory growth
+- **Keyset pagination**: Cursor encodes last sort key, stable across cache transitions
+- **TTL + sweep**: Configurable TTL with periodic cleanup
+- **ETS pool**: Pre-initialized pool of shared `ordered_set` tables (round-robin)
 - **Telemetry**: Full observability (hits, misses, table count, memory usage)
 
 ## Installation
@@ -59,10 +59,9 @@ children = [
 # Or with custom options
 {CachedPaginator,
   name: :my_cache,
-  fresh_ttl: 500,        # ms - TTL for new sessions
-  max_ttl: 15_000,       # ms - TTL for cursor-based access
+  ttl: 500,              # ms - cache entry TTL
   sweep_interval: 5_000, # ms - cleanup interval
-  max_tables: 200        # max ETS tables before backpressure
+  pool_size: 100         # pre-initialized ETS tables
 }
 ```
 
@@ -70,76 +69,36 @@ children = [
 
 ```elixir
 def list_items(filters, cursor, page_size) do
-  first_page = is_nil(cursor)
-
-  # get_or_create runs the query only on cache miss
-  {{table, total_count}, cursor} =
+  {cache_location, cursor} =
     CachedPaginator.get_or_create(:my_cache, filters, fn ->
-      # expensive query - runs once, cached for all users
-      Repo.all(from i in Item, where: ^filters, select: i.id, order_by: [desc: i.inserted_at])
-    end, cursor, first_page: first_page)
+      # return {sort_key, value} tuples
+      Repo.all(from i in Item, where: ^filters, select: {i.inserted_at, i.id})
+    end, cursor)
 
-  # fetch page from cache - O(page_size) regardless of position
-  start_idx = parse_page(cursor) * page_size
-  end_idx = start_idx + page_size - 1
-  ids = CachedPaginator.fetch_range(table, start_idx, end_idx)
+  {table, cache_key, _size} = cache_location
+  {items, updated_cursor} = CachedPaginator.fetch_after(table, cache_key, cursor, page_size)
 
-  # load full records
-  items = Repo.all(from i in Item, where: i.id in ^ids)
-
-  %{
-    items: items,
-    cursor: cursor,
-    total_count: total_count,
-    has_more: end_idx < total_count - 1
-  }
+  %{items: items, cursor: updated_cursor}
 end
-```
-
-### Direct API
-
-```elixir
-# Store data manually
-{{table, size}, cache_key} = CachedPaginator.store(:my_cache, filters, ids)
-
-# Get cached data (fresh TTL)
-{:ok, {table, size}, cache_key} = CachedPaginator.get(:my_cache, filters)
-
-# Get by cursor (extended TTL)
-{:ok, {table, size}, cache_key} = CachedPaginator.get_by_cursor(:my_cache, cache_key)
-
-# Fetch range from table
-ids = CachedPaginator.fetch_range(table, 0, 19)
-
-# Clear all cached data
-CachedPaginator.clear(:my_cache)
-
-# Get stats
-%{table_count: 5, pool_size: 2, memory_bytes: 1024} = CachedPaginator.stats(:my_cache)
 ```
 
 ## How It Works
 
 ### ETS Structure
 
-Each cache entry stores IDs indexed by position:
+Each cache entry stores items in a shared `ordered_set` ETS table using composite keys:
 
 ```
-ETS Table:
-{0, "id_abc"}
-{1, "id_def"}
-{2, "id_ghi"}
-...
+Data pool table (ordered_set):
+{{cache_key, {sort_key}}, value}
+{{cache_key, {sort_key1, sort_key2}}, value}
 ```
 
-This allows O(1) lookup for any page range via `fetch_range/3`.
+The `ordered_set` table type keeps keys sorted by Erlang term ordering. Combined with composite `{cache_key, sort_key}` keys, this enables efficient keyset pagination via `:ets.next/2` - walking forward from the last sort key to collect the next page.
 
-### Two-Tier TTL
+### TTL
 
-| Access Type | TTL | Purpose |
-|-------------|-----|---------|
-| No cursor / first page | `fresh_ttl` (300ms) | Fresh data for new sessions |
-| With cursor | `max_ttl` (10s) | Session can continue paginating |
+Cache entries expire after `ttl` milliseconds (default: 500ms). A periodic sweep runs every `sweep_interval` ms to clean up expired entries.
 
 ### Locking (Thundering Herd Prevention)
 
@@ -149,12 +108,9 @@ When multiple users request the same uncached data simultaneously:
 2. Concurrent requests wait (poll every 50ms)
 3. Once cached, all waiting requests get the same result
 
-### Backpressure
+### ETS Pool
 
-When `max_tables` is reached:
-- New store requests wait for tables to return to pool
-- Error logged: "max tables reached, waiting for available table"
-- Telemetry event emitted
+Tables are pre-initialized at startup and assigned to new cache entries via round-robin. Multiple cache entries coexist in the same table using composite keys, so table count stays constant regardless of how many queries are cached.
 
 ## Telemetry
 
@@ -165,36 +121,16 @@ When `max_tables` is reached:
 | `[:cached_paginator, :hit]` | - | `cache`, `filter_hash` |
 | `[:cached_paginator, :miss]` | - | `cache`, `filter_hash` |
 | `[:cached_paginator, :store]` | `duration`, `count` | `cache`, `filter_hash` |
-| `[:cached_paginator, :sweep]` | `table_count`, `pool_size`, `memory_bytes`, `expired_count` | `cache` |
-| `[:cached_paginator, :wait]` | - | `cache` |
-
-### Example
-
-```elixir
-:telemetry.attach(
-  "cache-metrics",
-  [:cached_paginator, :sweep],
-  fn _event, measurements, metadata, _config ->
-    Logger.info("""
-    Cache #{metadata.cache}:
-      Tables: #{measurements.table_count}
-      Memory: #{measurements.memory_bytes} bytes
-      Expired: #{measurements.expired_count}
-    """)
-  end,
-  nil
-)
-```
+| `[:cached_paginator, :sweep]` | `pool_size`, `memory_bytes`, `expired_count` | `cache` |
 
 ## Configuration Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `:name` | required | GenServer name for this instance |
-| `:fresh_ttl` | 300 | TTL (ms) for fresh cache entries |
-| `:max_ttl` | 10_000 | TTL (ms) for cursor-based access |
+| `:ttl` | 500 | Cache entry TTL (ms) |
 | `:sweep_interval` | 5_000 | Cleanup interval (ms) |
-| `:max_tables` | 100 | Max ETS tables before backpressure |
+| `:pool_size` | 100 | Pre-initialized ETS tables |
 
 ## License
 
