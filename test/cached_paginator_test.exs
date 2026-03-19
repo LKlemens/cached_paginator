@@ -290,6 +290,116 @@ defmodule CachedPaginatorTest do
     end
   end
 
+  describe "fetch_before/4" do
+    test "returns items in descending sort key order", %{cache: cache} do
+      filters = [status: :active]
+      items = [{3, "c"}, {1, "a"}, {2, "b"}]
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, filters, items)
+
+      cursor = CachedPaginator.encode_cursor(cache_key, nil)
+      {values, _cursor} = CachedPaginator.fetch_before(table, cache_key, cursor, 10)
+
+      assert values == ["c", "b", "a"]
+    end
+
+    test "paginates backwards with cursor", %{cache: cache} do
+      filters = [status: :active]
+      items = [{1, "a"}, {2, "b"}, {3, "c"}, {4, "d"}, {5, "e"}]
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, filters, items)
+
+      cursor = CachedPaginator.encode_cursor(cache_key, nil)
+
+      # Fetch last 3
+      {values, cursor2} = CachedPaginator.fetch_before(table, cache_key, cursor, 3)
+      assert values == ["e", "d", "c"]
+
+      # Cursor should have last_sort_key = {3} (smallest in the page)
+      assert {:ok, {_, _, {3}}} = CachedPaginator.decode_cursor(cursor2)
+
+      # Fetch next 2 (going further back)
+      {values2, cursor3} = CachedPaginator.fetch_before(table, cache_key, cursor2, 2)
+      assert values2 == ["b", "a"]
+
+      assert {:ok, {_, _, {1}}} = CachedPaginator.decode_cursor(cursor3)
+    end
+
+    test "returns empty list at beginning of data", %{cache: cache} do
+      items = [{1, "a"}, {2, "b"}]
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, [a: 1], items)
+
+      cursor = CachedPaginator.encode_cursor(cache_key, nil)
+
+      # Fetch all backwards
+      {values, cursor2} = CachedPaginator.fetch_before(table, cache_key, cursor, 10)
+      assert values == ["b", "a"]
+
+      # Fetch again — should be empty
+      {values2, _cursor3} = CachedPaginator.fetch_before(table, cache_key, cursor2, 10)
+      assert values2 == []
+    end
+
+    test "continues correctly after last_sort_key in new snapshot (keyset stability)", %{
+      cache: cache
+    } do
+      filters = [status: :active]
+
+      # First snapshot: items 1-5
+      items1 = [{1, "a"}, {2, "b"}, {3, "c"}, {4, "d"}, {5, "e"}]
+      {{table1, cache_key1, _}, _key1} = CachedPaginator.store(cache, filters, items1)
+
+      # Fetch last 2 items
+      cursor = CachedPaginator.encode_cursor(cache_key1, nil)
+      {values, cursor2} = CachedPaginator.fetch_before(table1, cache_key1, cursor, 2)
+      assert values == ["e", "d"]
+
+      # Second snapshot: "d" removed, "f" added
+      items2 = [{1, "a"}, {2, "b"}, {3, "c"}, {5, "e"}, {6, "f"}]
+      {{table2, cache_key2, _}, _key2} = CachedPaginator.store(cache, filters, items2)
+
+      # Preserve last_sort_key from cursor2, update cache_key
+      {:ok, {_, _, last_sk}} = CachedPaginator.decode_cursor(cursor2)
+      new_cursor = CachedPaginator.encode_cursor(cache_key2, last_sk)
+
+      # Continue from where we left off — should get items before sort_key {4}
+      {values2, _cursor3} = CachedPaginator.fetch_before(table2, cache_key2, new_cursor, 10)
+      assert values2 == ["c", "b", "a"]
+    end
+
+    test "with composite sort keys", %{cache: cache} do
+      items = [
+        {~U[2026-03-16 14:00:00Z], 10, "market_a"},
+        {~U[2026-03-16 14:00:00Z], 20, "market_b"},
+        {~U[2026-03-16 15:00:00Z], 10, "market_c"}
+      ]
+
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, [a: 1], items)
+
+      cursor = CachedPaginator.encode_cursor(cache_key, nil)
+
+      {values, cursor2} = CachedPaginator.fetch_before(table, cache_key, cursor, 2)
+      assert values == ["market_c", "market_b"]
+
+      {values2, _cursor3} = CachedPaginator.fetch_before(table, cache_key, cursor2, 10)
+      assert values2 == ["market_a"]
+    end
+
+    test "multiple queries coexist in shared tables", %{cache: cache} do
+      {{table1, key1, _}, _} = CachedPaginator.store(cache, [a: 1], [{1, "x"}, {2, "y"}])
+
+      {{table2, key2, _}, _} =
+        CachedPaginator.store(cache, [b: 2], [{1, "p"}, {2, "q"}, {3, "r"}])
+
+      cursor1 = CachedPaginator.encode_cursor(key1, nil)
+      cursor2 = CachedPaginator.encode_cursor(key2, nil)
+
+      {v1, _} = CachedPaginator.fetch_before(table1, key1, cursor1, 10)
+      {v2, _} = CachedPaginator.fetch_before(table2, key2, cursor2, 10)
+
+      assert v1 == ["y", "x"]
+      assert v2 == ["r", "q", "p"]
+    end
+  end
+
   describe "cursor encoding/decoding" do
     test "round-trip with nil last_sort_key" do
       cache_key = {12345, 67890}

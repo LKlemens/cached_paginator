@@ -80,7 +80,7 @@ defmodule CachedPaginator do
   - `store/2` — store items for filters
   - `clear/0` — clear all cached data
   - `stats/0` — memory and pool stats
-  - `fetch_after/4`, `encode_cursor/2`, `decode_cursor/1` — delegated directly
+  - `fetch_after/4`, `fetch_before/4`, `encode_cursor/2`, `decode_cursor/1` — delegated directly
   """
   defmacro __using__(opts) do
     otp_app = Keyword.fetch!(opts, :otp_app)
@@ -137,6 +137,7 @@ defmodule CachedPaginator do
       def stats, do: CachedPaginator.stats(__MODULE__)
 
       defdelegate fetch_after(table, cache_key, cursor, limit), to: CachedPaginator
+      defdelegate fetch_before(table, cache_key, cursor, limit), to: CachedPaginator
       defdelegate encode_cursor(cache_key, last_sort_key), to: CachedPaginator
       defdelegate decode_cursor(cursor), to: CachedPaginator
 
@@ -290,6 +291,39 @@ defmodule CachedPaginator do
   end
 
   @doc """
+  Fetch items before the cursor's last sort key using reverse keyset pagination.
+
+  Walks the ordered ETS table backwards from the last sort key encoded in the
+  cursor, collecting up to `limit` items. Returns items in descending order
+  and an updated cursor with the new last sort key.
+
+  ## Examples
+
+      {items, updated_cursor} = CachedPaginator.fetch_before(table, cache_key, cursor, 20)
+  """
+  @spec fetch_before(table_ref(), cache_key(), cursor(), non_neg_integer()) ::
+          {[term()], cursor()}
+  def fetch_before(table, cache_key, cursor, limit) do
+    decoded = decode_cursor(cursor)
+    last_sort_key = extract_last_sort_key(decoded)
+
+    start_key =
+      if last_sort_key do
+        {cache_key, last_sort_key}
+      else
+        # Position just after the last item for this cache_key.
+        # In Erlang term ordering, arity-3 tuples sort after all arity-2
+        # tuples, so this is guaranteed to be past any {cache_key, sort_key}.
+        {cache_key, {}, :sentinel}
+      end
+
+    {values, new_last_sk} = collect_prev(table, start_key, cache_key, limit, [], nil)
+
+    updated_cursor = update_cursor_sort_key(decoded, new_last_sk)
+    {values, updated_cursor}
+  end
+
+  @doc """
   Encodes a cache key and last_sort_key into a cursor string.
   """
   @spec encode_cursor(cache_key(), term()) :: cursor()
@@ -364,6 +398,23 @@ defmodule CachedPaginator do
       {^cache_key, sort_key} = next_key ->
         [{_, value}] = :ets.lookup(table, next_key)
         collect_next(table, next_key, cache_key, remaining - 1, [value | acc], sort_key)
+
+      _other_cache_key ->
+        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+    end
+  end
+
+  defp collect_prev(_table, _key, _cache_key, 0, acc, last_sk),
+    do: {Enum.reverse(acc), last_sk}
+
+  defp collect_prev(table, current_key, cache_key, remaining, acc, _last_sk) do
+    case :ets.prev(table, current_key) do
+      :"$end_of_table" ->
+        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+
+      {^cache_key, sort_key} = prev_key ->
+        [{_, value}] = :ets.lookup(table, prev_key)
+        collect_prev(table, prev_key, cache_key, remaining - 1, [value | acc], sort_key)
 
       _other_cache_key ->
         {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
