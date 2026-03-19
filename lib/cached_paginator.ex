@@ -117,7 +117,11 @@ defmodule CachedPaginator do
       def get_or_create(filters, fetch_fn),
         do: CachedPaginator.get_or_create(__MODULE__, filters, fetch_fn)
 
-      @spec get_or_create(CachedPaginator.filters(), (-> [tuple()]), CachedPaginator.cursor() | nil) ::
+      @spec get_or_create(
+              CachedPaginator.filters(),
+              (-> [tuple()]),
+              CachedPaginator.cursor() | nil
+            ) ::
               {CachedPaginator.cache_location(), CachedPaginator.cursor()}
       def get_or_create(filters, fetch_fn, cursor),
         do: CachedPaginator.get_or_create(__MODULE__, filters, fetch_fn, cursor)
@@ -440,7 +444,8 @@ defmodule CachedPaginator do
       config: config,
       sweep_interval: sweep_interval,
       pool: pool,
-      next_table: 0
+      next_table: 0,
+      sweep_ref: nil
     }
 
     {:ok, state}
@@ -480,36 +485,60 @@ defmodule CachedPaginator do
   end
 
   @impl true
+  def handle_info(:sweep_expired, %{sweep_ref: ref} = state) when is_reference(ref) do
+    # sweep already in progress, skip this tick
+    schedule_sweep(state.sweep_interval)
+    {:noreply, state}
+  end
+
   def handle_info(:sweep_expired, state) do
-    %{config: config, pool: pool, sweep_interval: sweep_interval} = state
+    %{config: config, pool: pool} = state
 
-    now = System.monotonic_time(:millisecond)
-    expired = collect_expired(config.registry, config.ttl, now)
+    task =
+      Task.async(fn ->
+        now = System.monotonic_time(:millisecond)
+        expired = collect_expired(config.registry, config.ttl, now)
 
-    Enum.each(expired, fn {{filter_hash, created_at} = key, table} ->
-      :ets.delete(config.registry, key)
-      :ets.match_delete(table, {{key, :_}, :_})
+        Enum.each(expired, fn {{filter_hash, created_at} = key, table} ->
+          :ets.delete(config.registry, key)
+          :ets.match_delete(table, {{key, :_}, :_})
 
-      case :ets.lookup(config.latest_index, filter_hash) do
-        [{^filter_hash, ^created_at, _, _}] ->
-          :ets.delete(config.latest_index, filter_hash)
+          case :ets.lookup(config.latest_index, filter_hash) do
+            [{^filter_hash, ^created_at, _, _}] ->
+              :ets.delete(config.latest_index, filter_hash)
 
-        _ ->
-          :ok
-      end
-    end)
+            _ ->
+              :ok
+          end
+        end)
 
-    memory_bytes = calculate_memory(pool)
+        memory_bytes = calculate_memory(pool)
 
-    CachedPaginator.Telemetry.emit_sweep(config.name, %{
-      pool_size: config.pool_size,
+        {length(expired), memory_bytes}
+      end)
+
+    {:noreply, %{state | sweep_ref: task.ref}}
+  end
+
+  @impl true
+  def handle_info({ref, {expired_count, memory_bytes}}, %{sweep_ref: ref} = state) do
+    Process.demonitor(ref, [:flush])
+
+    CachedPaginator.Telemetry.emit_sweep(state.config.name, %{
+      pool_size: state.config.pool_size,
       memory_bytes: memory_bytes,
-      expired_count: length(expired)
+      expired_count: expired_count
     })
 
-    schedule_sweep(sweep_interval)
+    schedule_sweep(state.sweep_interval)
 
-    {:noreply, state}
+    {:noreply, %{state | sweep_ref: nil}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{sweep_ref: ref} = state) do
+    Logger.warning("sweep task crashed: #{inspect(reason)}")
+    schedule_sweep(state.sweep_interval)
+    {:noreply, %{state | sweep_ref: nil}}
   end
 
   defp do_store(filters, items, state) do

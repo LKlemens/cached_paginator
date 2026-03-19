@@ -1,8 +1,8 @@
 defmodule CachedPaginator.MixProject do
   use Mix.Project
 
-  @version "0.1.1"
-  @source_url "https://github.com/TODO/cached_paginator"
+  @version "0.1.2"
+  @source_url "https://github.com/LKlemens/cached_paginator"
 
   def project do
     [
