@@ -22,7 +22,7 @@ defmodule CachedPaginatorTest do
 
       assert is_reference(table)
       assert size == 3
-      assert is_integer(filter_hash)
+      assert is_binary(filter_hash)
       assert is_integer(created_at)
       assert cache_key == {filter_hash, created_at}
     end
@@ -454,27 +454,29 @@ defmodule CachedPaginatorTest do
   end
 
   describe "cursor encoding/decoding" do
+    @test_hash :crypto.hash(:md5, "test_filters")
+
     test "round-trip with nil last_sort_key" do
-      cache_key = {12345, 67890}
+      cache_key = {@test_hash, 67890}
       cursor = CachedPaginator.encode_cursor(cache_key, nil)
 
-      assert {:ok, {12345, 67890, nil}} = CachedPaginator.decode_cursor(cursor)
+      assert {:ok, {@test_hash, 67890, nil}} = CachedPaginator.decode_cursor(cursor)
     end
 
     test "round-trip with last_sort_key" do
-      cache_key = {12345, 67890}
+      cache_key = {@test_hash, 67890}
       cursor = CachedPaginator.encode_cursor(cache_key, {42})
 
-      assert {:ok, {12345, 67890, {42}}} = CachedPaginator.decode_cursor(cursor)
+      assert {:ok, {@test_hash, 67890, {42}}} = CachedPaginator.decode_cursor(cursor)
     end
 
     test "round-trip with composite last_sort_key" do
-      cache_key = {12345, 67890}
+      cache_key = {@test_hash, 67890}
 
       cursor =
         CachedPaginator.encode_cursor(cache_key, {~U[2026-03-16 14:00:00Z], 10})
 
-      assert {:ok, {12345, 67890, {~U[2026-03-16 14:00:00Z], 10}}} =
+      assert {:ok, {@test_hash, 67890, {~U[2026-03-16 14:00:00Z], 10}}} =
                CachedPaginator.decode_cursor(cursor)
     end
 

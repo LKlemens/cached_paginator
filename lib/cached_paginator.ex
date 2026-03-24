@@ -155,7 +155,7 @@ defmodule CachedPaginator do
   @wait_poll_interval 50
 
   @type filters :: term()
-  @type cache_key :: {filter_hash :: non_neg_integer(), created_at :: integer()}
+  @type cache_key :: {filter_hash :: binary(), created_at :: integer()}
   @type cursor :: binary()
   @type table_ref :: :ets.tid()
   @type cache_location :: {table_ref(), cache_key(), non_neg_integer()}
@@ -206,7 +206,7 @@ defmodule CachedPaginator do
           {cache_location(), cursor()}
   def get_or_create(name, filters, fetch_fn, cursor \\ nil) do
     config = get_config(name)
-    filter_hash = :erlang.phash2(filters)
+    filter_hash = filter_hash(filters)
     decoded_cursor = decode_cursor(cursor)
 
     case get(name, filters) do
@@ -236,7 +236,7 @@ defmodule CachedPaginator do
           {:ok, cache_location(), cache_key()} | :miss
   def get(name, filters) do
     config = get_config(name)
-    filter_hash = :erlang.phash2(filters)
+    filter_hash = filter_hash(filters)
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(config.latest_index, filter_hash) do
@@ -339,7 +339,7 @@ defmodule CachedPaginator do
   Returns `{:ok, {filter_hash, created_at, last_sort_key}}` or `:error`.
   """
   @spec decode_cursor(cursor() | nil) ::
-          {:ok, {non_neg_integer(), integer(), term()}}
+          {:ok, {binary(), integer(), term()}}
           | :error
   def decode_cursor(nil), do: :error
 
@@ -348,7 +348,7 @@ defmodule CachedPaginator do
          {:ok, term} <- safe_binary_to_term(binary) do
       case term do
         {filter_hash, created_at, last_sort_key}
-        when is_integer(filter_hash) and is_integer(created_at) ->
+        when is_binary(filter_hash) and is_integer(created_at) ->
           {:ok, {filter_hash, created_at, last_sort_key}}
 
         _ ->
@@ -422,7 +422,7 @@ defmodule CachedPaginator do
   end
 
   defp locked_fetch_and_store(name, filters, fetch_fn, config) do
-    filter_hash = :erlang.phash2(filters)
+    filter_hash = filter_hash(filters)
 
     if :ets.insert_new(config.locks, {filter_hash, true}) do
       try do
@@ -595,7 +595,7 @@ defmodule CachedPaginator do
   defp do_store(filters, items, state) do
     %{config: config, pool: pool, next_table: next_table} = state
 
-    filter_hash = :erlang.phash2(filters)
+    filter_hash = filter_hash(filters)
     now = System.monotonic_time(:millisecond)
     cache_key = {filter_hash, now}
 
@@ -643,6 +643,8 @@ defmodule CachedPaginator do
     :ets.insert(table, entries)
     length(items)
   end
+
+  defp filter_hash(filters), do: :crypto.hash(:md5, :erlang.term_to_binary(filters))
 
   defp calculate_memory(pool) do
     Enum.reduce(pool, 0, fn table, acc ->
