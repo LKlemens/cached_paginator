@@ -288,6 +288,33 @@ defmodule CachedPaginatorTest do
       assert v1 == ["x", "y"]
       assert v2 == ["p", "q", "r"]
     end
+
+    test "first page fetch_after does not bleed into other cache_keys in same table" do
+      # pool_size: 1 forces all cache_keys into the same ETS ordered_set table
+      name = :"test_cache_bleed_#{:erlang.unique_integer([:positive])}"
+      {:ok, pid} = CachedPaginator.start_link(name: name, ttl: 500, pool_size: 1)
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      end)
+
+      # Store two filter sets — both land in the same table
+      {{table, key1, _}, _} = CachedPaginator.store(name, [a: 1], [{1, "x"}, {2, "y"}])
+      {{^table, key2, _}, _} = CachedPaginator.store(name, [b: 2], [{3, "p"}, {4, "q"}])
+
+      # Fetch first page (nil cursor) for whichever cache_key sorts later.
+      # With the old {cache_key} 1-tuple start key, collect_next would hit
+      # the other cache_key's entries first, match the _other_cache_key branch,
+      # and return [] instead of the correct items.
+      cursor1 = CachedPaginator.encode_cursor(key1, nil)
+      cursor2 = CachedPaginator.encode_cursor(key2, nil)
+
+      {v1, _} = CachedPaginator.fetch_after(table, key1, cursor1, 10)
+      {v2, _} = CachedPaginator.fetch_after(table, key2, cursor2, 10)
+
+      assert v1 == ["x", "y"]
+      assert v2 == ["p", "q"]
+    end
   end
 
   describe "fetch_before/4" do
@@ -397,6 +424,32 @@ defmodule CachedPaginatorTest do
 
       assert v1 == ["y", "x"]
       assert v2 == ["r", "q", "p"]
+    end
+
+    test "first page fetch_before does not bleed into other cache_keys in same table" do
+      # pool_size: 1 forces all cache_keys into the same ETS ordered_set table
+      name = :"test_cache_bleed_before_#{:erlang.unique_integer([:positive])}"
+      {:ok, pid} = CachedPaginator.start_link(name: name, ttl: 500, pool_size: 1)
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      end)
+
+      # Store two filter sets — both land in the same table
+      {{table, key1, _}, _} = CachedPaginator.store(name, [a: 1], [{1, "x"}, {2, "y"}])
+      {{^table, key2, _}, _} = CachedPaginator.store(name, [b: 2], [{3, "p"}, {4, "q"}])
+
+      # Fetch first reverse page (nil cursor) for each cache_key.
+      # With the old 3-tuple sentinel, collect_prev would start past all
+      # 2-tuple entries, hit other cache_key's entries first, and return [].
+      cursor1 = CachedPaginator.encode_cursor(key1, nil)
+      cursor2 = CachedPaginator.encode_cursor(key2, nil)
+
+      {v1, _} = CachedPaginator.fetch_before(table, key1, cursor1, 10)
+      {v2, _} = CachedPaginator.fetch_before(table, key2, cursor2, 10)
+
+      assert v1 == ["y", "x"]
+      assert v2 == ["q", "p"]
     end
   end
 

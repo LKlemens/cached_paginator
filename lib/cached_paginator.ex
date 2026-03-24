@@ -278,10 +278,9 @@ defmodule CachedPaginator do
       if last_sort_key do
         {cache_key, last_sort_key}
       else
-        # Position just before the first item for this cache_key.
-        # In Erlang term ordering, a bare tuple {cache_key} is smaller than
-        # any {cache_key, sort_key} tuple since shorter tuples sort first.
-        {cache_key}
+        # Uses {cache_key, {}} — a 2-tuple where {} (0-arity tuple) sorts before
+        # any real sort_key tuple.
+        {cache_key, {}}
       end
 
     {values, new_last_sk} = collect_next(table, start_key, cache_key, limit, [], nil)
@@ -314,7 +313,8 @@ defmodule CachedPaginator do
         # Position just after the last item for this cache_key.
         # In Erlang term ordering, arity-3 tuples sort after all arity-2
         # tuples, so this is guaranteed to be past any {cache_key, sort_key}.
-        {cache_key, {}, :sentinel}
+        # {cache_key, {}, :sentinel}
+        {cache_key, []}
       end
 
     {values, new_last_sk} = collect_prev(table, start_key, cache_key, limit, [], nil)
