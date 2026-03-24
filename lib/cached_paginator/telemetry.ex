@@ -9,21 +9,21 @@ defmodule CachedPaginator.Telemetry do
   Emitted when a cache hit occurs.
 
   Measurements: `%{}`
-  Metadata: `%{cache: atom(), filter_hash: integer()}`
+  Metadata: `%{cache: atom(), filter_hash: binary()}`
 
   ### `[:cached_paginator, :miss]`
 
   Emitted when a cache miss occurs.
 
   Measurements: `%{}`
-  Metadata: `%{cache: atom(), filter_hash: integer()}`
+  Metadata: `%{cache: atom(), filter_hash: binary()}`
 
   ### `[:cached_paginator, :store]`
 
   Emitted when data is stored in cache.
 
   Measurements: `%{duration: integer(), count: integer()}`
-  Metadata: `%{cache: atom(), filter_hash: integer()}`
+  Metadata: `%{cache: atom(), filter_hash: binary()}`
 
   ### `[:cached_paginator, :sweep]`
 
@@ -45,7 +45,7 @@ defmodule CachedPaginator.Telemetry do
   """
 
   @doc false
-  @spec emit_hit(atom(), integer()) :: :ok
+  @spec emit_hit(atom(), binary()) :: :ok
   def emit_hit(cache, filter_hash) do
     :telemetry.execute(
       [:cached_paginator, :hit],
@@ -55,7 +55,7 @@ defmodule CachedPaginator.Telemetry do
   end
 
   @doc false
-  @spec emit_miss(atom(), integer()) :: :ok
+  @spec emit_miss(atom(), binary()) :: :ok
   def emit_miss(cache, filter_hash) do
     :telemetry.execute(
       [:cached_paginator, :miss],
@@ -65,7 +65,7 @@ defmodule CachedPaginator.Telemetry do
   end
 
   @doc false
-  @spec emit_store(atom(), integer(), integer(), integer()) :: :ok
+  @spec emit_store(atom(), binary(), integer(), integer()) :: :ok
   def emit_store(cache, filter_hash, count, duration) do
     :telemetry.execute(
       [:cached_paginator, :store],

@@ -370,7 +370,8 @@ defmodule CachedPaginator do
   # Private API functions
 
   defp get_config(name) do
-    :persistent_term.get({__MODULE__, name, :config})
+    :persistent_term.get({__MODULE__, name, :config}, nil) ||
+      raise ArgumentError, "CachedPaginator #{inspect(name)} not started"
   end
 
   defp extract_last_sort_key({:ok, {_, _, last_sort_key}}), do: last_sort_key

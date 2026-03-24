@@ -1,7 +1,7 @@
 defmodule CachedPaginator.MixProject do
   use Mix.Project
 
-  @version "0.1.5"
+  @version "0.1.6"
   @source_url "https://github.com/LKlemens/cached_paginator"
 
   def project do
@@ -26,6 +26,7 @@ defmodule CachedPaginator.MixProject do
   defp deps do
     [
       {:telemetry, "~> 1.0"},
+      {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]
   end
