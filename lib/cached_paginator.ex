@@ -394,14 +394,14 @@ defmodule CachedPaginator do
   defp collect_next(table, current_key, cache_key, remaining, acc, _last_sk) do
     case :ets.next(table, current_key) do
       :"$end_of_table" ->
-        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+        {Enum.reverse(acc), elem(current_key, 1)}
 
       {^cache_key, sort_key} = next_key ->
         [{_, value}] = :ets.lookup(table, next_key)
         collect_next(table, next_key, cache_key, remaining - 1, [value | acc], sort_key)
 
       _other_cache_key ->
-        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+        {Enum.reverse(acc), elem(current_key, 1)}
     end
   end
 
@@ -411,14 +411,14 @@ defmodule CachedPaginator do
   defp collect_prev(table, current_key, cache_key, remaining, acc, _last_sk) do
     case :ets.prev(table, current_key) do
       :"$end_of_table" ->
-        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+        {Enum.reverse(acc), elem(current_key, 1)}
 
       {^cache_key, sort_key} = prev_key ->
         [{_, value}] = :ets.lookup(table, prev_key)
         collect_prev(table, prev_key, cache_key, remaining - 1, [value | acc], sort_key)
 
       _other_cache_key ->
-        {Enum.reverse(acc), if(acc == [], do: nil, else: elem(current_key, 1))}
+        {Enum.reverse(acc), elem(current_key, 1)}
     end
   end
 

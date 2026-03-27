@@ -255,6 +255,25 @@ defmodule CachedPaginatorTest do
       assert values2 == ["c", "d", "e", "f"]
     end
 
+    test "does not wrap around after reaching end of data", %{cache: cache} do
+      items = [{1, "a"}, {2, "b"}, {3, "c"}]
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, [a: 1], items)
+
+      cursor = CachedPaginator.encode_cursor(cache_key, nil)
+
+      # Fetch all items
+      {values, cursor2} = CachedPaginator.fetch_after(table, cache_key, cursor, 10)
+      assert values == ["a", "b", "c"]
+
+      # First call past the end — empty
+      {values2, cursor3} = CachedPaginator.fetch_after(table, cache_key, cursor2, 10)
+      assert values2 == []
+
+      # Second call past the end — must still be empty (no wrap-around)
+      {values3, _cursor4} = CachedPaginator.fetch_after(table, cache_key, cursor3, 10)
+      assert values3 == []
+    end
+
     test "with composite sort keys", %{cache: cache} do
       items = [
         {~U[2026-03-16 14:00:00Z], 10, "market_a"},
@@ -390,6 +409,25 @@ defmodule CachedPaginatorTest do
       # Continue from where we left off — should get items before sort_key {4}
       {values2, _cursor3} = CachedPaginator.fetch_before(table2, cache_key2, new_cursor, 10)
       assert values2 == ["c", "b", "a"]
+    end
+
+    test "does not wrap around after reaching beginning of data", %{cache: cache} do
+      items = [{1, "a"}, {2, "b"}, {3, "c"}]
+      {{table, cache_key, _size}, _key} = CachedPaginator.store(cache, [a: 1], items)
+
+      cursor = CachedPaginator.encode_cursor(cache_key, nil)
+
+      # Fetch all items backwards
+      {values, cursor2} = CachedPaginator.fetch_before(table, cache_key, cursor, 10)
+      assert values == ["c", "b", "a"]
+
+      # First call past the beginning — empty
+      {values2, cursor3} = CachedPaginator.fetch_before(table, cache_key, cursor2, 10)
+      assert values2 == []
+
+      # Second call past the beginning — must still be empty (no wrap-around)
+      {values3, _cursor4} = CachedPaginator.fetch_before(table, cache_key, cursor3, 10)
+      assert values3 == []
     end
 
     test "with composite sort keys", %{cache: cache} do
